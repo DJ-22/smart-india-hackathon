@@ -1,5 +1,10 @@
-import streamlit as st
+import os
+import time
+import uuid
+
 import requests
+import streamlit as st
+import streamlit.components.v1 as components
 import plotly.graph_objects as go
 
 from risk import (
@@ -13,10 +18,15 @@ from risk import (
 # CONFIG
 # =========================================================
 
-BACKEND_URL = "http://localhost:8000"
+BACKEND_URL = os.getenv(
+    "FASTAPI_URL",
+    "http://localhost:8000"
+)
 
-# Temporary session identifier.
-# This is not detection data.
+LIVEKIT_URL = os.getenv("LIVEKIT_URL")
+
+# Existing demo session. Keep this stable so the existing
+# backend/session flow continues to work.
 SESSION_ID = "demo-session"
 
 
@@ -53,6 +63,10 @@ if "backend_returned_empty" not in st.session_state:
 if "demo_mode" not in st.session_state:
     st.session_state.demo_mode = False
 
+if "livekit_token" not in st.session_state:
+    st.session_state.livekit_token = None
+
+
 # =========================================================
 # BACKEND
 # =========================================================
@@ -77,7 +91,9 @@ def get_windows():
     try:
         response = requests.get(
             f"{BACKEND_URL}/session/{SESSION_ID}/windows",
-            params={"since": st.session_state.last_window_id},
+            params={
+                "since": st.session_state.last_window_id
+            },
             timeout=1,
         )
 
@@ -95,6 +111,93 @@ def get_windows():
         st.session_state.backend_connected = False
         return []
 
+# =========================================================
+# LIVEKIT
+# =========================================================
+
+from tokens import make_token
+
+
+def get_livekit_credentials():
+
+    if not LIVEKIT_URL:
+        raise RuntimeError(
+            "LIVEKIT_URL is not set in the environment."
+        )
+
+    token = make_token(
+        identity=f"voiceguard-{SESSION_ID}",
+        room="demo",
+        publish=True,
+        subscribe=True,
+    )
+
+    return {
+        "url": LIVEKIT_URL,
+        "token": token,
+    }
+
+
+def render_livekit():
+
+    try:
+
+        credentials = get_livekit_credentials()
+
+        livekit_url = credentials["url"]
+        token = credentials["token"]
+
+    except Exception as exc:
+
+        st.error(
+            f"LiveKit connection setup failed: {exc}"
+        )
+
+        return
+
+    html_path = os.path.join(
+        os.path.dirname(__file__),
+        "livekit",
+        "index.html",
+    )
+
+    if not os.path.exists(html_path):
+
+        st.error(
+            f"LiveKit UI not found: {html_path}"
+        )
+
+        return
+
+    with open(
+        html_path,
+        "r",
+        encoding="utf-8",
+    ) as file:
+
+        html = file.read()
+
+    # Pass temporary credentials to the
+    # embedded LiveKit page.
+    html = html.replace(
+        "</body>",
+        f"""
+        <script>
+            window.VOICEGUARD_LIVEKIT_URL =
+                {livekit_url!r};
+
+            window.VOICEGUARD_LIVEKIT_TOKEN =
+                {token!r};
+        </script>
+        </body>
+        """,
+    )
+
+    components.html(
+        html,
+        height=500,
+        scrolling=False,
+    )
 
 # =========================================================
 # PROCESS WINDOWS
@@ -117,7 +220,6 @@ def process_windows(windows):
             window["window_id"]
         )
 
-        # Context currently comes from UI controls.
         context = {
             "unknown_caller": st.session_state.get(
                 "unknown_caller",
@@ -185,7 +287,9 @@ with status_left:
         st.warning("● WAITING")
 
 with status_middle:
-    st.write(f"**Session:** `{SESSION_ID}`")
+    st.write(
+        f"**Session:** `{SESSION_ID}`"
+    )
 
 with status_right:
     if st.session_state.windows:
@@ -205,6 +309,180 @@ with status_right:
 
 
 # =========================================================
+# MAIN INTERFACE
+# =========================================================
+#
+# LEFT  = LiveKit call
+# RIGHT = Existing VoiceGuard monitoring
+#
+# Existing features are retained below.
+# =========================================================
+
+call_col, monitor_col = st.columns(
+    [1.15, 1]
+)
+
+
+# =========================================================
+# LIVEKIT CALL
+# =========================================================
+
+with call_col:
+
+    st.subheader("📞 Live Call")
+
+    render_livekit()
+
+
+# =========================================================
+# SECURITY MONITOR
+# =========================================================
+
+with monitor_col:
+
+    st.subheader("🛡️ Security Monitor")
+
+    risk_state = (
+        st.session_state
+        .risk_engine
+        .state()
+    )
+
+    risk_value = risk_state.get("risk")
+    risk_band = risk_state.get("band", "GREEN")
+
+    risk_col, band_col = st.columns(2)
+
+    with risk_col:
+
+        if risk_value is None:
+            st.metric(
+                "Impersonation Risk",
+                "—"
+            )
+        else:
+            st.metric(
+                "Impersonation Risk",
+                f"{risk_value:.2f}"
+            )
+
+    with band_col:
+
+        if risk_band == "RED":
+            st.error("🔴 RED")
+
+        elif risk_band == "AMBER":
+            st.warning("🟠 AMBER")
+
+        else:
+            st.success("🟢 GREEN")
+
+    if risk_value is not None:
+        st.progress(
+            min(
+                max(
+                    float(risk_value),
+                    0.0
+                ),
+                1.0
+            )
+        )
+
+    st.divider()
+
+    st.write("**Detection Pipeline**")
+
+    level_counts = {
+        0: 0,
+        1: 0,
+        2: 0,
+    }
+
+    for window in st.session_state.windows:
+
+        level = window.get(
+            "level_resolved"
+        )
+
+        if level in level_counts:
+            level_counts[level] += 1
+
+    total_windows = sum(
+        level_counts.values()
+    )
+
+    if total_windows:
+
+        l0_pct = (
+            level_counts[0] /
+            total_windows
+        )
+
+        l1_pct = (
+            level_counts[1] /
+            total_windows
+        )
+
+        l2_pct = (
+            level_counts[2] /
+            total_windows
+        )
+
+        st.progress(
+            l0_pct,
+            text=f"L0 — Screening  {l0_pct:.0%}"
+        )
+
+        st.progress(
+            l1_pct,
+            text=f"L1 — Detection  {l1_pct:.0%}"
+        )
+
+        st.progress(
+            l2_pct,
+            text=f"L2 — Attribution  {l2_pct:.0%}"
+        )
+
+    else:
+
+        st.info(
+            "Waiting for detection windows..."
+        )
+
+    st.divider()
+
+    st.write("**Speaker Verification**")
+
+    if st.session_state.windows:
+
+        latest = st.session_state.windows[-1]
+
+        speaker_sim = latest.get(
+            "speaker_sim"
+        )
+
+        if speaker_sim is None:
+
+            st.info(
+                "No speaker verification result "
+                "for the latest window."
+            )
+
+        else:
+
+            st.metric(
+                "Voice Match",
+                f"{speaker_sim:.2f}"
+            )
+
+    else:
+
+        st.info(
+            "Waiting for speaker verification..."
+        )
+
+
+# =========================================================
 # NO DATA STATE
 # =========================================================
 
@@ -218,9 +496,6 @@ if not st.session_state.windows:
         "No detection results are displayed until the backend "
         "returns WindowScore data."
     )
-
-    # Still show context controls because these are
-    # inputs to the risk engine, not fabricated detection data.
 
 
 # =========================================================
@@ -264,7 +539,9 @@ with ctx4:
 
 st.divider()
 
-left, right = st.columns([1, 2])
+left, right = st.columns(
+    [1, 2]
+)
 
 
 # =========================================================
@@ -275,7 +552,11 @@ with left:
 
     st.subheader("Current Risk")
 
-    risk_state = st.session_state.risk_engine.state()
+    risk_state = (
+        st.session_state
+        .risk_engine
+        .state()
+    )
 
     if risk_state["risk"] is None:
 
@@ -309,7 +590,13 @@ with left:
             st.success("🟢 GREEN RISK")
 
         st.progress(
-            min(max(risk, 0.0), 1.0)
+            min(
+                max(
+                    float(risk),
+                    0.0
+                ),
+                1.0
+            )
         )
 
 
@@ -321,7 +608,11 @@ with right:
 
     st.subheader("Risk Over Time")
 
-    history = st.session_state.risk_engine.history
+    history = (
+        st.session_state
+        .risk_engine
+        .history
+    )
 
     if not history:
 
@@ -354,13 +645,13 @@ with right:
         )
 
         fig.add_hline(
-            y=0.45,
+            y=L1_AMBER,
             line_dash="dash",
             annotation_text="AMBER"
         )
 
         fig.add_hline(
-            y=0.75,
+            y=L1_RED,
             line_dash="dash",
             annotation_text="RED"
         )
@@ -402,20 +693,27 @@ level_counts = {
 
 for window in st.session_state.windows:
 
-    level = window.get("level_resolved")
+    level = window.get(
+        "level_resolved"
+    )
 
     if level in level_counts:
         level_counts[level] += 1
 
 
-total_windows = sum(level_counts.values())
+total_windows = sum(
+    level_counts.values()
+)
 
 c1, c2, c3 = st.columns(3)
 
 with c1:
 
     if total_windows:
-        percentage = level_counts[0] / total_windows
+        percentage = (
+            level_counts[0] /
+            total_windows
+        )
         value = f"{percentage:.0%}"
     else:
         value = "—"
@@ -429,7 +727,10 @@ with c1:
 with c2:
 
     if total_windows:
-        percentage = level_counts[1] / total_windows
+        percentage = (
+            level_counts[1] /
+            total_windows
+        )
         value = f"{percentage:.0%}"
     else:
         value = "—"
@@ -443,7 +744,10 @@ with c2:
 with c3:
 
     if total_windows:
-        percentage = level_counts[2] / total_windows
+        percentage = (
+            level_counts[2] /
+            total_windows
+        )
         value = f"{percentage:.0%}"
     else:
         value = "—"
@@ -498,7 +802,11 @@ if st.session_state.windows:
 # ALERT
 # =========================================================
 
-risk_state = st.session_state.risk_engine.state()
+risk_state = (
+    st.session_state
+    .risk_engine
+    .state()
+)
 
 if risk_state["band"] == "RED":
 
@@ -517,13 +825,19 @@ if risk_state["band"] == "RED":
     a1, a2, a3 = st.columns(3)
 
     with a1:
-        st.button("📞 Request Call-back")
+        st.button(
+            "📞 Request Call-back"
+        )
 
     with a2:
-        st.button("🚨 Escalate")
+        st.button(
+            "🚨 Escalate"
+        )
 
     with a3:
-        st.button("Dismiss")
+        st.button(
+            "Dismiss"
+        )
 
 
 # =========================================================
@@ -534,7 +848,11 @@ st.divider()
 
 st.subheader("Event Log")
 
-events = st.session_state.risk_engine.events
+events = (
+    st.session_state
+    .risk_engine
+    .events
+)
 
 if not events:
 
