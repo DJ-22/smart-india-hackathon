@@ -1,5 +1,6 @@
 """Standalone diagnostic: join the LiveKit room, capture 10 s of remote
-audio, write test.wav, print loud stats. NOT part of the server.
+audio, write a WAV (default data/captures/test.wav), print loud stats.
+NOT part of the server.
 
 Usage (from repo root):
   python server\\capture_test.py --room demo
@@ -29,7 +30,7 @@ from server.tokens import URL, make_token
 
 TARGET_SR = 16000
 CAPTURE_S = 10.0
-OUT_PATH = "test.wav"
+DEFAULT_OUT = Path(__file__).resolve().parent.parent / "data" / "captures" / "test.wav"
 
 
 async def _capture_track(track: rtc.Track, buf: List[np.ndarray],
@@ -67,7 +68,11 @@ async def main() -> None:
                          "default: lock on to the first audio track seen")
     ap.add_argument("--join-as", default="capture-test",
                     help="identity this diagnostic joins the room as")
+    ap.add_argument("--out", default=str(DEFAULT_OUT),
+                    help="where to write the captured WAV")
     args = ap.parse_args()
+    out_path = Path(args.out).resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     token = make_token(args.join_as, room=args.room, publish=False, subscribe=True)
     print(f"connecting to {URL} room={args.room!r} as {args.join_as!r} (subscribe-only)")
@@ -116,7 +121,7 @@ async def main() -> None:
         await room.disconnect()
 
     if not buf:
-        print("nothing captured - no test.wav written.")
+        print("nothing captured - no WAV written.")
         return
 
     audio = np.concatenate(buf)
@@ -124,7 +129,7 @@ async def main() -> None:
     peak = float(np.max(np.abs(audio)))
     rms = float(np.sqrt(np.mean(audio ** 2)))
 
-    with wave.open(OUT_PATH, "wb") as w:
+    with wave.open(str(out_path), "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(TARGET_SR)
@@ -133,7 +138,7 @@ async def main() -> None:
     print()
     print(f"captured {dur:.1f}s from {state['locked']!r}  "
           f"frame_sr={info.get('sr', '?')} ch={info.get('ch', '?')}")
-    print(f"wrote {OUT_PATH}  {dur:.1f}s  peak={peak:.3f}  rms={rms:.4f}")
+    print(f"wrote {out_path}  {dur:.1f}s  peak={peak:.3f}  rms={rms:.4f}")
     print()
     print("=== HOW TO READ THESE NUMBERS ===")
     print(" peak ~0.000            -> NO audio: phone mic muted/denied, wrong room,")
@@ -144,8 +149,8 @@ async def main() -> None:
     print(" peak 0.05-0.9, rms 0.01-0.15 -> healthy speech levels. Good to go.")
     print(" peak 1.000             -> clipping; back off from the mic a little.")
     print()
-    print(" NOW ACTUALLY LISTEN TO test.wav (double-click it). Numbers can look")
-    print(" fine while the audio is garbled - your ears are the real check.")
+    print(f" NOW ACTUALLY LISTEN TO {out_path} (double-click it). Numbers can")
+    print(" look fine while the audio is garbled - your ears are the real check.")
 
 
 if __name__ == "__main__":

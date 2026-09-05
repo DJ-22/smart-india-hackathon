@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Audio: scratch captures/recordings are never committed;
+# small test clips in fixtures/ ARE committed (shared test inputs).
+data/
+*.wav
+fixtures/
