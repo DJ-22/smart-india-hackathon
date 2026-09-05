@@ -3,6 +3,11 @@ audio, write test.wav, print loud stats. NOT part of the server.
 
 Usage (from repo root):
   python server\\capture_test.py --room demo
+  python server\\capture_test.py --room demo --identity phone1   # record only phone1
+
+Records exactly ONE participant's audio: the one named by --identity, or
+else the first remote audio track seen. Other tracks are ignored (never
+mixed into the buffer).
 
 Loud print() is deliberate here - this is a diagnostic script.
 """
@@ -57,25 +62,41 @@ async def _capture_track(track: rtc.Track, buf: List[np.ndarray],
 async def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--room", default="demo")
-    ap.add_argument("--identity", default="capture-test")
+    ap.add_argument("--identity", default=None,
+                    help="record ONLY this participant's audio; "
+                         "default: lock on to the first audio track seen")
+    ap.add_argument("--join-as", default="capture-test",
+                    help="identity this diagnostic joins the room as")
     args = ap.parse_args()
 
-    token = make_token(args.identity, room=args.room, publish=False, subscribe=True)
-    print(f"connecting to {URL} room={args.room!r} as {args.identity!r} (subscribe-only)")
+    token = make_token(args.join_as, room=args.room, publish=False, subscribe=True)
+    print(f"connecting to {URL} room={args.room!r} as {args.join_as!r} (subscribe-only)")
+    if args.identity:
+        print(f"will record ONLY participant {args.identity!r}")
 
     room = rtc.Room()
     buf: List[np.ndarray] = []
     info: dict = {}
     done = asyncio.Event()
+    state: dict = {"locked": None}  # identity we are recording; one track only
 
     @room.on("track_subscribed")
     def on_track(track: rtc.Track, pub: rtc.RemoteTrackPublication,
                  participant: rtc.RemoteParticipant) -> None:
-        if track.kind == rtc.TrackKind.KIND_AUDIO:
-            print(f"subscribed to audio track from participant {participant.identity!r}")
-            asyncio.create_task(_capture_track(track, buf, info, done))
-        else:
+        if track.kind != rtc.TrackKind.KIND_AUDIO:
             print(f"ignoring non-audio track from {participant.identity!r}")
+            return
+        if args.identity and participant.identity != args.identity:
+            print(f"skipping audio from {participant.identity!r} "
+                  f"(recording only {args.identity!r})")
+            return
+        if state["locked"] is not None:
+            print(f"already recording {state['locked']!r}, "
+                  f"ignoring track from {participant.identity!r}")
+            return
+        state["locked"] = participant.identity
+        print(f"locked on to participant {participant.identity!r}")
+        asyncio.create_task(_capture_track(track, buf, info, done))
 
     await room.connect(URL, token)
     print("connected. waiting for a remote audio track "
@@ -88,6 +109,9 @@ async def main() -> None:
         if not buf:
             print("  -> never received audio. Is the phone publishing into the "
                   "SAME room name? Is its mic unmuted?")
+            if args.identity:
+                print(f"  -> also check: does the phone's identity exactly match "
+                      f"{args.identity!r}? (case-sensitive)")
     finally:
         await room.disconnect()
 
@@ -107,7 +131,8 @@ async def main() -> None:
         w.writeframes((np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes())
 
     print()
-    print(f"captured {dur:.1f}s  frame_sr={info.get('sr', '?')} ch={info.get('ch', '?')}")
+    print(f"captured {dur:.1f}s from {state['locked']!r}  "
+          f"frame_sr={info.get('sr', '?')} ch={info.get('ch', '?')}")
     print(f"wrote {OUT_PATH}  {dur:.1f}s  peak={peak:.3f}  rms={rms:.4f}")
     print()
     print("=== HOW TO READ THESE NUMBERS ===")
