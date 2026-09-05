@@ -238,6 +238,11 @@ class Cascade:
         self._lock = threading.Lock()
         self._sessions: Dict[str, _SessionState] = {}
         self._latencies: Dict[int, List[int]] = {0: [], 1: [], 2: []}
+        # per-stage wall time, so VAD cost is visible separately from the
+        # L0 classifier (the ~4ms architecture budget is for L0 alone)
+        self._stage_latencies: Dict[str, List[float]] = {
+            "vad": [], "l0": [], "l1": [], "l2": []
+        }
         self._warmup()
 
     # -- construction helpers ------------------------------------------------
@@ -313,33 +318,40 @@ class Cascade:
         t0 = time.perf_counter()
         wav = np.asarray(wav, dtype=np.float32).ravel()
         sess = self._session(session_id)
+        stage_ms: Dict[str, float] = {}
 
-        speech = vad.speech_ratio(wav, SR)
+        def _timed(stage: str, fn):
+            t = time.perf_counter()
+            result = fn()
+            stage_ms[stage] = (time.perf_counter() - t) * 1000
+            return result
+
+        speech = _timed("vad", lambda: vad.speech_ratio(wav, SR))
         sim: Optional[float] = None
 
         if self.cascade_enabled:
             if speech < self.min_speech_ratio:
                 prob, level = 0.0, 0  # not enough speech: never touch a model
             else:
-                p0 = self.l0.prob_fake(wav, SR)
+                p0 = _timed("l0", lambda: self.l0.prob_fake(wav, SR))
                 if p0 < self.t_low:
                     prob, level = p0, 0  # discharged as obviously real
                 elif p0 > self.t_high and self._l2_ready(sess):
                     # obvious artifact: skip L1, go straight to the identity check
-                    sim = self._verify(wav, sess)
+                    sim = _timed("l2", lambda: self._verify(wav, sess))
                     prob, level = combine_l2(p0, sim), 2
                 else:
-                    p1 = self.l1.prob_fake(wav, SR)
+                    p1 = _timed("l1", lambda: self.l1.prob_fake(wav, SR))
                     if sess.hot and self._l2_ready(sess):
-                        sim = self._verify(wav, sess)
+                        sim = _timed("l2", lambda: self._verify(wav, sess))
                         prob, level = combine_l2(p1, sim), 2
                     else:
                         prob, level = p1, 1
         else:
             # kill switch: flat pipeline, L0 bypassed, L1 always-on
-            p1 = self.l1.prob_fake(wav, SR)
+            p1 = _timed("l1", lambda: self.l1.prob_fake(wav, SR))
             if sess.hot and self._l2_ready(sess):
-                sim = self._verify(wav, sess)
+                sim = _timed("l2", lambda: self._verify(wav, sess))
                 prob, level = combine_l2(p1, sim), 2
             else:
                 prob, level = p1, 1
@@ -348,6 +360,8 @@ class Cascade:
         latency_ms = int((time.perf_counter() - t0) * 1000)
         with self._lock:
             self._latencies[level].append(latency_ms)
+            for stage, ms in stage_ms.items():
+                self._stage_latencies[stage].append(ms)
 
         return WindowScore(
             session_id=session_id,
@@ -384,21 +398,27 @@ class Cascade:
                 sess.clean_streak = 0
 
     # -- metrics -------------------------------------------------------------
+    @staticmethod
+    def _pctl_summary(vals: List[float]) -> Dict[str, Any]:
+        return {
+            "p50_ms": round(statistics.median(vals), 2),
+            "p95_ms": round(sorted(vals)[max(0, int(len(vals) * 0.95) - 1)], 2),
+            "calls": len(vals),
+        }
+
     def metrics(self) -> Dict[str, Any]:
         with self._lock:
             counts = {f"level_{lvl}": len(v) for lvl, v in self._latencies.items()}
             total = sum(counts.values())
-            lat: Dict[str, Any] = {}
-            for lvl, vals in self._latencies.items():
-                if vals:
-                    lat[f"level_{lvl}"] = {
-                        "p50_ms": int(statistics.median(vals)),
-                        "p95_ms": int(sorted(vals)[max(0, int(len(vals) * 0.95) - 1)]),
-                    }
+            lat = {f"level_{lvl}": self._pctl_summary(vals)
+                   for lvl, vals in self._latencies.items() if vals}
+            stage_lat = {stage: self._pctl_summary(vals)
+                         for stage, vals in self._stage_latencies.items() if vals}
             hot = sum(1 for s in self._sessions.values() if s.hot)
         return {
             "per_level_counts": counts,
             "latency": lat,
+            "stage_latency": stage_lat,  # VAD cost vs each classifier, separately
             "discharge_rate": round(counts["level_0"] / total, 3) if total else None,
             "hot_sessions": hot,
             "level_versions": [self.l0.version, self.l1.version, self.l2.version],

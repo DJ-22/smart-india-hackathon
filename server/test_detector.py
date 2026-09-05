@@ -41,6 +41,29 @@ def _noise() -> np.ndarray:
     return (np.random.default_rng(1).standard_normal(3 * SR) * 0.3).astype(np.float32)
 
 
+def _enroll_audio() -> np.ndarray:
+    p = Path(__file__).resolve().parent.parent / "fixtures" / "enroll8s.wav"
+    with wave.open(str(p)) as w:
+        return np.frombuffer(w.readframes(w.getnframes()),
+                             dtype=np.int16).astype(np.float32) / 32768.0
+
+
+class _CountingLevel:
+    """Wraps a level scorer, counting calls and remembering the last output,
+    so tests can PROVE a level ran (or was skipped) rather than infer it."""
+
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self.version = inner.version
+        self.calls = 0
+        self.last: float | None = None
+
+    def prob_fake(self, wav: np.ndarray, sr: int = SR) -> float:
+        self.calls += 1
+        self.last = self.inner.prob_fake(wav, sr)
+        return self.last
+
+
 class _FixedL0:
     """Pin L0's output so routing tests are deterministic regardless of
     what audio the stub heuristic would score."""
@@ -159,9 +182,137 @@ def test_metrics_shape() -> None:
     c = Cascade(manifest_path=NO_MANIFEST)
     c.score(_speech(), "s", 0.0, 0)
     m = c.metrics()
-    assert set(m) >= {"per_level_counts", "latency", "discharge_rate",
-                      "hot_sessions", "level_versions"}
+    assert set(m) >= {"per_level_counts", "latency", "stage_latency",
+                      "discharge_rate", "hot_sessions", "level_versions"}
     assert sum(m["per_level_counts"].values()) == 1
+    # VAD and L0 both ran on a speech window and are timed SEPARATELY
+    assert "vad" in m["stage_latency"] and "l0" in m["stage_latency"]
+    assert m["stage_latency"]["vad"]["calls"] == 1
+
+
+# ---------------------------------------------------------------------------
+# route-forcing tests: every cascade path must actually execute
+# ---------------------------------------------------------------------------
+def test_route_t_low_zero_nothing_discharges() -> None:
+    c = Cascade(manifest_path=NO_MANIFEST)
+    c.t_low = 0.0  # no p0 can be < 0: discharge route closed
+    c.l1 = l1 = _CountingLevel(c.l1)
+    ws = c.score(_speech(), "s", 0.0, 0)
+    assert ws.level_resolved == 1
+    assert l1.calls == 1, "L1 must actually run when discharge is impossible"
+    assert abs(ws.prob_fake - l1.last) < 1e-3
+
+
+def test_route_t_high_zero_skips_l1_straight_to_l2() -> None:
+    c = Cascade(manifest_path=NO_MANIFEST, l2_enabled=True)
+    c.enroll("s", _enroll_audio())
+    c.t_high = 0.0  # every p0 exceeds it: obvious-artifact route
+    c.t_low = -1.0  # and the discharge route is closed
+    c.l0 = l0 = _CountingLevel(c.l0)
+    c.l1 = l1 = _CountingLevel(c.l1)
+    ws = c.score(_speech(), "s", 0.0, 0)
+    assert ws.level_resolved == 2
+    assert l0.calls == 1
+    assert l1.calls == 0, "L1 must be SKIPPED on the straight-to-L2 route"
+    assert ws.speaker_sim is not None
+    # the combine rule actually fired: prob = max(p0, 1 - sim)
+    assert abs(ws.prob_fake - combine_l2(l0.last, ws.speaker_sim)) < 1e-3
+
+
+def test_route_t_high_zero_without_enrollment_falls_to_l1() -> None:
+    c = Cascade(manifest_path=NO_MANIFEST, l2_enabled=True)
+    c.t_high = 0.0
+    c.t_low = -1.0
+    c.l1 = l1 = _CountingLevel(c.l1)
+    ws = c.score(_speech(), "s", 0.0, 0)  # no voiceprint enrolled
+    assert ws.level_resolved == 1, "no enrollment: L2 skipped cleanly, not an error"
+    assert l1.calls == 1
+    assert ws.speaker_sim is None
+
+
+def test_hot_stickiness_survives_clean_windows() -> None:
+    c = Cascade(manifest_path=NO_MANIFEST, l2_enabled=True)
+    c.enroll("s", _enroll_audio())
+    c.t_high = 0.0
+    c.t_low = -1.0  # close the discharge route so p0 reaches the T_HIGH check
+    ws = c.score(_speech(), "s", 0.0, 0)  # forces the session onto L2
+    assert ws.level_resolved == 2
+    assert c._session("s").hot
+    c.t_high = config.T_HIGH  # restore: subsequent windows score normally
+    c.t_low = config.T_LOW
+    # N-1 clean (gated silence, prob 0.0) windows: must STILL be hot
+    for i in range(config.HYSTERESIS_CLEAN_WINDOWS - 1):
+        c.score(_silence(), "s", float(i + 1), i + 1)
+        assert c._session("s").hot, f"cooled too early, after {i + 1} clean windows"
+    # the Nth clean window finally cools it
+    c.score(_silence(), "s", 99.0, 99)
+    assert not c._session("s").hot
+
+
+# ---------------------------------------------------------------------------
+# kill switches, flipped FOR REAL via env vars in a subprocess (exercises
+# the env -> common.config -> Cascade default plumbing end to end)
+# ---------------------------------------------------------------------------
+def _run_probe(env_overrides: dict, code: str) -> dict:
+    import json
+    import os
+    import subprocess
+
+    env = os.environ.copy()
+    env.update(env_overrides)
+    out = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env, capture_output=True, text=True,
+        cwd=str(Path(__file__).resolve().parent.parent),
+    )
+    assert out.returncode == 0, f"probe crashed:\n{out.stderr[-2000:]}"
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def test_kill_switch_env_cascade_disabled() -> None:
+    r = _run_probe({"CASCADE_ENABLED": "0"}, r"""
+import json, sys
+sys.path.insert(0, ".")
+import numpy as np
+from common import config
+assert config.CASCADE_ENABLED is False, "env var did not reach config"
+from server.detector import Cascade
+c = Cascade(manifest_path="ml/checkpoints/DOES_NOT_EXIST.json")
+ws = c.score(np.zeros(48000, dtype=np.float32), "s", 0.0, 0)  # even silence
+print(json.dumps({"level": ws.level_resolved, "levels_active": c.levels_active,
+                  "stages": sorted(c.metrics()["stage_latency"])}))
+""")
+    assert r["level"] == 1, "flat mode: even silence must resolve at L1"
+    assert 0 not in r["levels_active"]
+    assert "l0" not in r["stages"], "L0 must never have executed"
+
+
+def test_kill_switch_env_l2_disabled() -> None:
+    r = _run_probe({"L2_ENABLED": "0"}, r"""
+import json, sys, wave
+sys.path.insert(0, ".")
+import numpy as np
+from common import config
+assert config.L2_ENABLED is False, "env var did not reach config"
+from server.detector import Cascade
+with wave.open("fixtures/enroll8s.wav") as w:
+    enroll = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+with wave.open("fixtures/win3s.wav") as w:
+    speech = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+c = Cascade(manifest_path="ml/checkpoints/DOES_NOT_EXIST.json")
+c.enroll("s", enroll)          # even enrolled...
+c._session("s").hot = True     # ...and hot...
+c.t_high = 0.0                 # ...and on the obvious-artifact route
+c.t_low = -1.0
+ws = c.score(speech, "s", 0.0, 0)
+print(json.dumps({"level": ws.level_resolved, "sim": ws.speaker_sim,
+                  "levels_active": c.levels_active,
+                  "stages": sorted(c.metrics()["stage_latency"])}))
+""")
+    assert r["level"] != 2, "L2 must never run with L2_ENABLED=0"
+    assert r["sim"] is None
+    assert 2 not in r["levels_active"]
+    assert "l2" not in r["stages"], "L2 must never have executed"
 
 
 def test_bytes_adapter_roundtrip() -> None:
