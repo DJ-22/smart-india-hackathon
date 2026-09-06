@@ -213,7 +213,7 @@ app.add_middleware(  # Streamlit UI polls from another port
     allow_headers=["*"],
 )
 
-def _log_startup_banner(active_scorer: Any) -> None:
+def _log_startup_banner(active_scorer: Any, probe_result: Optional[Dict[str, Any]]) -> None:
     """One glanceable block so you know exactly what's running without curling."""
     is_stub = isinstance(active_scorer, StubScorer)
     cascade = getattr(active_scorer, "cascade", None)
@@ -232,6 +232,25 @@ def _log_startup_banner(active_scorer: Any) -> None:
         # came from the shell env, .env, or the built-in default
         return "manifest" if effective != cfg else config.source_of(name)
 
+    # Two-sided wiring probe (ml/fixtures/probe.json): one genuine + one cloned
+    # clip, each asserted against its expected P(fake). Shows up here so an
+    # upside-down checkpoint is caught in the banner, not during the demo.
+    sanity_line = ""
+    if probe_result and probe_result.get("clips"):
+        by_role = {c["role"]: c for c in probe_result["clips"]}
+        parts: List[str] = []
+        for role in ("real", "fake"):
+            c = by_role.get(role)
+            if c is None:
+                continue
+            if c["skipped"]:
+                parts.append(f"{role} p_fake=n/a [SKIP]")
+            else:
+                verdict = "PASS" if c["pass"] else "FAIL"
+                parts.append(f"{role} p_fake={c['prob_fake']:.6f} [{verdict}]")
+        if parts:
+            sanity_line = "  wiring probe  : " + "  ".join(parts) + "\n"
+
     bar = "=" * 66
     log.info("\n%s\n"
              "  VOICE-CLONE DETECTION SERVER  |  MODE: %s (%s)\n"
@@ -239,6 +258,7 @@ def _log_startup_banner(active_scorer: Any) -> None:
              "  thresholds    : T_LOW=%s (%s)  T_HIGH=%s (%s)  MIN_SPEECH_RATIO=%s (%s)\n"
              "  hysteresis    : HYSTERESIS_CLEAN_WINDOWS=%s (%s)\n"
              "  kill switches : CASCADE_ENABLED=%s (%s)  L2_ENABLED=%s (%s)\n"
+             "%s"
              "  source key    : shell env > .env > default (manifest overrides thresholds)\n"
              "%s",
              bar, "STUB (random scores)" if is_stub else "REAL", config.source_of("STUB_MODE"),
@@ -248,7 +268,7 @@ def _log_startup_banner(active_scorer: Any) -> None:
              min_speech, src("MIN_SPEECH_RATIO", min_speech, config.MIN_SPEECH_RATIO),
              hyst, src("HYSTERESIS_CLEAN_WINDOWS", hyst, config.HYSTERESIS_CLEAN_WINDOWS),
              cascade_enabled, config.source_of("CASCADE_ENABLED"),
-             l2_enabled, config.source_of("L2_ENABLED"), bar)
+             l2_enabled, config.source_of("L2_ENABLED"), sanity_line, bar)
 
 
 scorer = _build_scorer()
@@ -262,7 +282,15 @@ if not isinstance(scorer, StubScorer):
     from server.detector import AudioDecodeError, EnrollmentError
     _AUDIO_400_ERRORS = (AudioDecodeError, EnrollmentError)
 
-_log_startup_banner(scorer)
+# Run the wiring probe once at startup; /health and /metrics expose probe_ok.
+# None  = did not run (stub mode, or no probe.json / missing clip)
+# True  = ran and every clip landed within tolerance
+# False = ran and a clip failed its assertion or was skipped (e.g. sha mismatch)
+_cascade = getattr(scorer, "cascade", None)
+probe_result: Optional[Dict[str, Any]] = _cascade.sanity_probe() if _cascade is not None else None
+probe_ok: Optional[bool] = probe_result.get("ok") if probe_result else None
+
+_log_startup_banner(scorer, probe_result)
 
 
 @app.post("/score")
@@ -328,6 +356,7 @@ def health() -> Dict[str, Any]:
         "model_version": scorer.model_version,
         "levels_active": scorer.levels_active,
         "stub_mode": isinstance(scorer, StubScorer),
+        "probe_ok": probe_ok,  # None = probe did not run at startup
     }
 
 
@@ -335,6 +364,7 @@ def health() -> Dict[str, Any]:
 def get_metrics() -> Dict[str, Any]:
     snap = metrics.snapshot()
     snap.update(scorer.metrics_extra())
+    snap["probe_ok"] = probe_ok  # None = probe did not run at startup
     return snap
 
 

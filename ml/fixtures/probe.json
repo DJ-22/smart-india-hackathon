@@ -1,0 +1,42 @@
+{
+  "purpose": "Startup wiring probe: one genuine and one cloned clip from the speaker-disjoint val split, with the P(fake) this pipeline returns for each. Assert both, not just one -- a probe that only checks a negative passes when the model is loaded upside down.",
+  "model_version": "l1_run4+l0-v1",
+  "l1_path": "ml/checkpoints/l1_run4",
+  "sr": 16000,
+  "crop_s": 4.0,
+  "how_to_score": "ml.infer.read_audio(path) -> L1Scorer.score_waves([wav])[0]. score_waves centre-crops to crop_s, so the whole file goes in.",
+  "tolerance": 0.01,
+  "determinism": "Bit-identical over 5 runs and across cuda/cpu on the reference box; the 0.01 tolerance is headroom for a different GPU or torch build, not observed drift.",
+  "clips": [
+    {
+      "role": "real",
+      "file": "02281_BEN_F_HAPPY_00053.wav",
+      "label": 0,
+      "sha256": "5ba5b7e5e49cf8040b77802e728b1770858dfdb987f63c845f6e54353fdbe338",
+      "language": "Bengali",
+      "corpus": "indictts",
+      "speaker": "BEN_F",
+      "duration_s": 6.49,
+      "expected_prob_fake": {
+        "clean": 0.000532,
+        "opus": 0.000582
+      },
+      "expected_band": "GREEN"
+    },
+    {
+      "role": "fake",
+      "file": "02472_BEN_F_BOOK_00155.wav",
+      "label": 1,
+      "sha256": "94ecd09ab1b7e44d94d175b939209f0a302ec85a8b3fcaddd5404e1d723ce655",
+      "language": "Bengali",
+      "corpus": "indictts",
+      "speaker": "BEN_F",
+      "duration_s": 6.98,
+      "expected_prob_fake": {
+        "clean": 0.999887,
+        "opus": 0.999894
+      },
+      "expected_band": "RED"
+    }
+  ]
+}

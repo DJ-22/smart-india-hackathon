@@ -133,12 +133,64 @@ class RealL0:
 
     def __init__(self, model_path: str) -> None:
         import lightgbm  # optional dep; guarded by caller
+        # Daksh's exact training feature extractor + crop helper. NEVER
+        # reimplemented here: the LightGBM booster's 76 inputs are positional,
+        # so any drift in feature order silently corrupts every prediction.
+        from ml.data import crop_or_pad
+        from ml.features import N_FEATURES, l0_features
 
-        self._booster = lightgbm.Booster(model_file=model_path)
+        self._crop_or_pad = crop_or_pad
+        self._l0_features = l0_features
+        # Load from a line-ending-normalised string, not model_file: git's
+        # autocrlf checks l0.txt out with CRLF on Windows, and LightGBM's text
+        # parser only accepts LF ("expect a tree here" otherwise). Reading the
+        # bytes ourselves makes the load robust to however git left the file.
+        model_text = Path(model_path).read_text().replace("\r\n", "\n")
+        self._booster = lightgbm.Booster(model_str=model_text)
+
+        # Honour the l0.json sidecar next to l0.txt: it pins the feature count,
+        # sample rate, crop length and thread budget the booster was fit under.
+        self._crop_n = int(config.WINDOW_S * SR)   # fallback if json is absent
+        self._num_threads = 0                      # 0 = lightgbm default
+        meta_path = Path(model_path).with_suffix(".json")
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text())
+            fmt = meta.get("format")
+            if fmt not in (None, "lightgbm-text"):
+                log.warning("l0.json format=%r (expected 'lightgbm-text')", fmt)
+            n_feat = meta.get("n_features")
+            if n_feat is not None and int(n_feat) != N_FEATURES:
+                # a hard stop: feeding the wrong width is worse than a stub
+                raise ValueError(
+                    f"l0.json n_features={n_feat} != ml.features.N_FEATURES="
+                    f"{N_FEATURES}: feature drift, refusing to serve real L0")
+            meta_sr = meta.get("sr")
+            if meta_sr is not None and int(meta_sr) != SR:
+                log.warning("l0.json sr=%s != server SR=%s", meta_sr, SR)
+            if meta.get("crop_s"):
+                self._crop_n = int(float(meta["crop_s"]) * SR)
+            self._num_threads = int(meta.get("num_threads", 0) or 0)
+        else:
+            log.warning("l0.json not found beside %s; using window length as crop",
+                        model_path)
+
+        # Not every lightgbm build accepts num_threads on predict(); probe once
+        # (this also warms the predictor) and only pass it if it's honoured.
+        self._predict_kwargs: Dict[str, Any] = {}
+        probe = np.zeros((1, N_FEATURES), dtype=np.float32)
+        if self._num_threads:
+            try:
+                self._booster.predict(probe, num_threads=self._num_threads)
+                self._predict_kwargs = {"num_threads": self._num_threads}
+            except TypeError:
+                log.warning("lightgbm predict() ignores num_threads on this build")
 
     def prob_fake(self, wav: np.ndarray, sr: int = SR) -> float:
-        feats = mfcc_prosody_features(wav, sr)
-        return float(self._booster.predict(feats[None, :])[0])
+        # centre-crop/pad to the training length, then the identical feature
+        # vector train_l0.py built -> P(fake) from the booster.
+        w = self._crop_or_pad(np.asarray(wav, dtype=np.float32), self._crop_n, None, False)
+        feats = self._l0_features(w, sr)
+        return float(self._booster.predict(feats[None, :], **self._predict_kwargs)[0])
 
 
 class StubL1:
@@ -156,24 +208,25 @@ class RealL1:
     version = "l1-wav2vec2"
 
     def __init__(self, model_path: str) -> None:
-        import torch
-        from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
+        # Daksh's shared scorer owns feature extraction, the model, and (via
+        # fake_index/id2label) which logit is 'fake'. We do not reimplement any
+        # of that here, so serving can never disagree with evaluate.py.
+        from ml.infer import L1Scorer
 
-        self._torch = torch
-        self._fe = AutoFeatureExtractor.from_pretrained(model_path)
-        self._model = AutoModelForAudioClassification.from_pretrained(model_path).eval()
-        id2label = getattr(self._model.config, "id2label", {}) or {}
-        self._fake_idx = next(
-            (int(i) for i, lbl in id2label.items()
-             if any(k in str(lbl).lower() for k in ("fake", "spoof", "synth"))),
-            1,  # convention with Daksh: index 1 = fake if labels are unnamed
-        )
+        self._scorer = L1Scorer(ckpt=model_path)
+        self._scorer.warm()  # so the first live window isn't a cold-start outlier
+        self.fake_idx = int(self._scorer.fake_i)  # resolved by fake_index(id2label)
+
+        # L1Scorer._prep pads/crops every window to crop_s (4 s) via crop_or_pad;
+        # our live windows are WINDOW_S. Note the mismatch once, at startup.
+        win_n = int(config.WINDOW_S * SR)
+        if win_n != self._scorer.n:
+            log.info("L1: window %.1fs (%d samples) != model crop_s %.1fs (%d); "
+                     "L1Scorer pads/crops to crop_s on every score",
+                     config.WINDOW_S, win_n, self._scorer.n / SR, self._scorer.n)
 
     def prob_fake(self, wav: np.ndarray, sr: int = SR) -> float:
-        inputs = self._fe(wav, sampling_rate=sr, return_tensors="pt")
-        with self._torch.no_grad():
-            logits = self._model(**inputs).logits[0]
-        return float(self._torch.softmax(logits, dim=-1)[self._fake_idx])
+        return float(self._scorer.score_waves([np.asarray(wav, dtype=np.float32)])[0])
 
 
 class StubL2:
@@ -254,6 +307,15 @@ class Cascade:
 
         self.l0 = self._load_level("L0", manifest.get("l0_path"), RealL0, StubL0)
         self.l1 = self._load_level("L1", manifest.get("l1_path"), RealL1, StubL1)
+        # The model resolves its own fake logit via fake_index(id2label); the
+        # manifest's fake_label_index is advisory. Log a disagreement, never
+        # override -- id2label is what the weights were actually trained against.
+        manifest_fake_idx = manifest.get("fake_label_index")
+        if isinstance(self.l1, RealL1) and manifest_fake_idx is not None \
+                and int(manifest_fake_idx) != self.l1.fake_idx:
+            log.warning("L1 fake index: model uses %d (via id2label) but manifest "
+                        "fake_label_index=%s; keeping the model's",
+                        self.l1.fake_idx, manifest_fake_idx)
         # L2 is pretrained (no teammate checkpoint); only attempt the real
         # (heavy, downloads voxceleb weights) path if the manifest asks.
         l2_source = manifest.get("l2_source")
@@ -464,6 +526,95 @@ class Cascade:
     def _verify(self, wav: np.ndarray, sess: _SessionState) -> float:
         assert sess.embedding is not None
         return cosine_sim(self.l2.embed(wav, SR), sess.embedding)
+
+    def sanity_probe(self) -> Optional[Dict[str, Any]]:
+        """Wiring probe driven by ml/fixtures/probe.json: score one genuine and
+        one cloned clip through the loaded L1 EXACTLY as the file specifies, and
+        assert BOTH against their expected P(fake). Two-sided on purpose - a
+        one-sided check passes even when the model is loaded upside down.
+
+        Never auto-corrects, never blocks startup: it tells you loudly and lets
+        the server come up. Everything (filenames, expected values, tolerance,
+        hashes) comes from probe.json so Daksh can update the probe without a
+        code change. Returns None when it did not run (no/unreadable probe.json,
+        a missing clip, or L1 running as a stub)."""
+        probe_dir = config.REPO_ROOT / "ml" / "fixtures"
+        probe_json = probe_dir / "probe.json"
+        if not isinstance(self.l1, RealL1):
+            log.info("wiring probe skipped: L1 is a stub, nothing real to check")
+            return None
+        if not probe_json.exists():
+            log.info("wiring probe skipped: %s not found", probe_json)
+            return None
+        try:
+            spec = json.loads(probe_json.read_text())
+            tol = float(spec["tolerance"])
+            clip_specs = list(spec["clips"])
+        except Exception as exc:  # noqa: BLE001 - a malformed probe must not stop startup
+            log.info("wiring probe skipped: %s unreadable (%s)", probe_json, exc)
+            return None
+        missing = [c["file"] for c in clip_specs if not (probe_dir / c["file"]).exists()]
+        if missing:
+            # a half-probe can't make the two-sided claim that is the whole point
+            log.info("wiring probe skipped: missing clip(s) %s", missing)
+            return None
+
+        from ml.infer import read_audio  # same loader probe.json names
+
+        results: List[Dict[str, Any]] = []
+        for c in clip_specs:
+            role = str(c.get("role", "?"))
+            path = probe_dir / c["file"]
+            expected = float(c["expected_prob_fake"]["clean"])
+            entry: Dict[str, Any] = {"role": role, "file": c["file"],
+                                     "expected": expected, "prob_fake": None,
+                                     "pass": False, "skipped": False}
+            # integrity first: a swapped/corrupt clip makes every assertion below
+            # meaningless, so verify sha256 before scoring and skip on mismatch.
+            want_sha = str(c.get("sha256", "")).lower()
+            got_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+            if want_sha and got_sha != want_sha:
+                log.critical("PROBE: %s clip %s sha256 mismatch (corrupted or "
+                             "replaced) - skipping, NOT scoring against wrong "
+                             "audio. want=%s got=%s", role, c["file"], want_sha, got_sha)
+                entry["skipped"] = True
+                results.append(entry)
+                continue
+            try:
+                # probe.json's exact recipe: whole file in; score_waves centre-
+                # crops to crop_s. This is NOT the live 3 s window path.
+                p = float(self.l1.prob_fake(read_audio(str(path))))
+            except Exception as exc:  # noqa: BLE001 - never let a probe stop startup
+                log.critical("PROBE: %s clip %s failed to score (%s) - skipping",
+                             role, c["file"], exc)
+                entry["skipped"] = True
+                results.append(entry)
+                continue
+            entry["prob_fake"] = p
+            entry["pass"] = abs(p - expected) <= tol
+            if not entry["pass"]:
+                log.critical("PROBE FAIL: %s clip %s expected p_fake=%.6f got=%.6f "
+                             "(|diff|=%.6f > tol=%.4f)", role, c["file"], expected, p,
+                             abs(p - expected), tol)
+            results.append(entry)
+
+        ok = bool(results) and all(r["pass"] and not r["skipped"] for r in results)
+        if not ok:
+            scored = {r["role"]: r for r in results if not r["skipped"]}
+            real, fake = scored.get("real"), scored.get("fake")
+            if real and fake and real["prob_fake"] >= 0.5 and fake["prob_fake"] < 0.5:
+                cause = ("L1 LABEL INVERSION - genuine speech scores fake and the "
+                         "clone scores real; the model is loaded upside down")
+            elif real and fake and not real["pass"] and not fake["pass"]:
+                cause = ("WRONG CHECKPOINT - both clips are off their expected "
+                         "values; this may not be l1_run4")
+            else:
+                cause = "a clip is off expected - check the checkpoint and the audio"
+            log.critical("PROBE: wiring check FAILED (%s). NOT auto-correcting; the "
+                         "server is still coming up.", cause)
+        else:
+            log.info("wiring probe PASSED: both clips within tolerance %.4f", tol)
+        return {"ran": True, "ok": ok, "tolerance": tol, "clips": results}
 
     def _update_hysteresis(self, sess: _SessionState, prob: float, level: int) -> None:
         if level == 2:

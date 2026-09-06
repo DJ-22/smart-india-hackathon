@@ -10,6 +10,11 @@ import os
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# Daksh's ml/ modules (ml/config.py and its import chain: features, infer, data)
+# do `from common.config import REPO` expecting a string repo-root path. That
+# was intentionally not brought across in the config merge, but wiring his real
+# models in requires it and ml/ is off-limits to edit, so expose the alias here.
+REPO: str = str(REPO_ROOT)
 
 # Capture which keys came from the real shell environment BEFORE loading .env,
 # so we can report provenance in the banner. (Precedence is enforced by
