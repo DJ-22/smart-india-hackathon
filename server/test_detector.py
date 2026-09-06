@@ -15,30 +15,33 @@ from common import config
 from server.detector import Cascade, CascadeScorer, combine_l2, decode_wav
 
 SR = config.TARGET_SR
+WIN_N = int(config.WINDOW_S * SR)  # one full window of audio, tracks WINDOW_S (4 s)
 NO_MANIFEST = "ml/checkpoints/DOES_NOT_EXIST.json"  # forces stubs even if real manifest appears
 
 
 def _silence() -> np.ndarray:
-    return np.zeros(int(3 * SR), dtype=np.float32)
+    return np.zeros(WIN_N, dtype=np.float32)
 
 
 def _speech() -> np.ndarray:
-    """Real captured speech from the committed fixture if present, else a
+    """One WINDOW_S window of real captured speech from the committed fixture
+    if present (tiled up if the fixture is shorter than a window), else a
     synthetic voiced-ish signal loud enough to pass the energy-fallback VAD."""
     p = Path(__file__).resolve().parent.parent / "fixtures" / "win3s.wav"
     if p.exists():
         with wave.open(str(p)) as w:
             audio = np.frombuffer(w.readframes(w.getnframes()),
                                   dtype=np.int16).astype(np.float32) / 32768.0
-        if len(audio) >= 3 * SR:
-            return audio[: 3 * SR]
-    t = np.arange(3 * SR) / SR
+        if len(audio) > 0:
+            reps = -(-WIN_N // len(audio))  # ceil-divide: enough copies for a window
+            return np.tile(audio, reps)[:WIN_N]
+    t = np.arange(WIN_N) / SR
     voiced = 0.3 * np.sin(2 * np.pi * 140 * t) * (0.6 + 0.4 * np.sin(2 * np.pi * 3 * t))
     return voiced.astype(np.float32)
 
 
 def _noise() -> np.ndarray:
-    return (np.random.default_rng(1).standard_normal(3 * SR) * 0.3).astype(np.float32)
+    return (np.random.default_rng(1).standard_normal(WIN_N) * 0.3).astype(np.float32)
 
 
 def _enroll_audio() -> np.ndarray:
@@ -102,11 +105,26 @@ def test_silence_gate_never_touches_models() -> None:
 
 def test_kill_switch_cascade_disabled_runs_flat() -> None:
     c = Cascade(manifest_path=NO_MANIFEST, cascade_enabled=False)
-    # even silence must hit L1: L0 (incl. the speech gate) is bypassed
-    for wav in (_silence(), _speech(), _noise()):
-        ws = c.score(wav, "s", 0.0, 0)
-        assert ws.level_resolved == 1, "flat mode must resolve at L1"
-    assert 0 not in c.levels_active
+    # flat mode bypasses the L0 CLASSIFIER, but the VAD gate is independent of
+    # the cascade and still runs: real speech flows through to L1, while silence
+    # is gated at L0 (proven separately in test_silence_gated_in_flat_mode).
+    assert c.score(_speech(), "s", 0.0, 0).level_resolved == 1, "speech must resolve at L1"
+    assert c.score(_silence(), "s", 0.0, 0).level_resolved == 0, "silence gated even in flat mode"
+    assert 0 not in c.levels_active  # the L0 classifier is inactive; the gate is not L0
+
+
+def test_silence_gated_in_flat_mode() -> None:
+    # Regression: the VAD gate must run in the flat (kill-switch) path too. A
+    # silent window scored with CASCADE_ENABLED=False must resolve at L0 with
+    # prob_fake=0.0 and NEVER reach L1 (which returns ~0.27 on silence, and up
+    # to ~0.9 on near-silence live windows).
+    c = Cascade(manifest_path=NO_MANIFEST, cascade_enabled=False)
+    c.l1 = l1 = _CountingLevel(c.l1)
+    ws = c.score(_silence(), "s", 0.0, 0)
+    assert ws.level_resolved == 0
+    assert ws.prob_fake == 0.0
+    assert ws.speech_ratio < config.MIN_SPEECH_RATIO
+    assert l1.calls == 0, "L1 must never be touched on a gated window, flat mode included"
 
 
 def test_kill_switch_l2_disabled() -> None:
@@ -195,8 +213,9 @@ def test_enroll_validation() -> None:
     from server.detector import ENROLL_MIN_S, EnrollmentError
 
     c = Cascade(manifest_path=NO_MANIFEST, l2_enabled=True)
-    # too short (3s < 4s), too long (40s), and silence must all be rejected
-    for bad, why in ((_speech(), "too short"),
+    # too short (3s < ENROLL_MIN_S 4s), too long (40s), and silence must all be
+    # rejected. _speech() is now a full 4s window, so slice it for the short case.
+    for bad, why in ((_speech()[: int(3 * SR)], "too short"),
                      (np.tile(_enroll_audio(), 6), "too long"),
                      (np.zeros(int(8 * SR), dtype=np.float32), "silence")):
         try:
@@ -433,20 +452,22 @@ def _run_probe(env_overrides: dict, code: str) -> dict:
 
 def test_kill_switch_env_cascade_disabled() -> None:
     r = _run_probe({"CASCADE_ENABLED": "0"}, r"""
-import json, sys
+import json, sys, wave
 sys.path.insert(0, ".")
 import numpy as np
 from common import config
 assert config.CASCADE_ENABLED is False, "env var did not reach config"
 from server.detector import Cascade
+with wave.open("fixtures/win3s.wav") as w:
+    speech = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
 c = Cascade(manifest_path="ml/checkpoints/DOES_NOT_EXIST.json")
-ws = c.score(np.zeros(48000, dtype=np.float32), "s", 0.0, 0)  # even silence
+ws = c.score(speech, "s", 0.0, 0)  # real speech in flat mode -> straight to L1
 print(json.dumps({"level": ws.level_resolved, "levels_active": c.levels_active,
                   "stages": sorted(c.metrics()["stage_latency"])}))
 """)
-    assert r["level"] == 1, "flat mode: even silence must resolve at L1"
+    assert r["level"] == 1, "flat mode: speech must resolve at L1 (L0 classifier bypassed)"
     assert 0 not in r["levels_active"]
-    assert "l0" not in r["stages"], "L0 must never have executed"
+    assert "l0" not in r["stages"], "the L0 classifier must never have executed in flat mode"
 
 
 def test_kill_switch_env_l2_disabled() -> None:

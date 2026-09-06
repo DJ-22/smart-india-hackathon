@@ -37,7 +37,7 @@ if __name__ == "__main__":
         session_id="selftest",
         window_id=0,
         t_start=0.0,
-        t_end=3.0,
+        t_end=4.0,
         prob_fake=0.42,
         level_resolved=1,
         speech_ratio=0.87,

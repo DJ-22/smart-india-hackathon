@@ -217,12 +217,13 @@ class RealL1:
         self._scorer.warm()  # so the first live window isn't a cold-start outlier
         self.fake_idx = int(self._scorer.fake_i)  # resolved by fake_index(id2label)
 
-        # L1Scorer._prep pads/crops every window to crop_s (4 s) via crop_or_pad;
-        # our live windows are WINDOW_S. Note the mismatch once, at startup.
+        # L1Scorer._prep crops/pads every window to crop_s via crop_or_pad.
+        # WINDOW_S is set to equal crop_s so no zero-padding happens; if someone
+        # overrides WINDOW_S away from crop_s, say so once at startup.
         win_n = int(config.WINDOW_S * SR)
         if win_n != self._scorer.n:
-            log.info("L1: window %.1fs (%d samples) != model crop_s %.1fs (%d); "
-                     "L1Scorer pads/crops to crop_s on every score",
+            log.warning("L1: window %.1fs (%d samples) != model crop_s %.1fs (%d); "
+                        "L1Scorer pads/crops to crop_s on every score",
                      config.WINDOW_S, win_n, self._scorer.n / SR, self._scorer.n)
 
     def prob_fake(self, wav: np.ndarray, sr: int = SR) -> float:
@@ -387,7 +388,7 @@ class Cascade:
         return stub_cls()
 
     def _warmup(self) -> None:
-        """Run every level once on a dummy 3 s window so the first real
+        """Run every level once on a dummy WINDOW_S window so the first real
         request isn't a latency outlier."""
         rng = np.random.default_rng(0)
         dummy = (rng.standard_normal(int(config.WINDOW_S * SR)) * 0.05).astype(np.float32)
@@ -467,28 +468,33 @@ class Cascade:
         gated = False
         discharged = False
 
-        if self.cascade_enabled:
-            if speech < self.min_speech_ratio:
-                prob, level = 0.0, 0  # not enough speech: never touch a model
-                gated = True
+        # The VAD gate is INDEPENDENT of the cascade: it runs on every window in
+        # both the cascaded and the flat (kill-switch) paths. A window without
+        # enough speech carries no evidence, and L1 returns a spurious prob_fake
+        # (up to ~0.9) on silence -- so below the ratio we resolve real at L0 and
+        # never touch a model, whether or not the cascade is enabled.
+        if speech < self.min_speech_ratio:
+            prob, level = 0.0, 0  # not enough speech: never touch a model
+            gated = True
+        elif self.cascade_enabled:
+            p0 = _timed("l0", lambda: self.l0.prob_fake(wav, SR))
+            if p0 < self.t_low:
+                prob, level = p0, 0  # discharged as obviously real
+                discharged = True
+            elif p0 > self.t_high and self._l2_ready(sess):
+                # obvious artifact: skip L1, go straight to the identity check
+                sim = _timed("l2", lambda: self._verify(wav, sess))
+                prob, level = combine_l2(p0, sim), 2
             else:
-                p0 = _timed("l0", lambda: self.l0.prob_fake(wav, SR))
-                if p0 < self.t_low:
-                    prob, level = p0, 0  # discharged as obviously real
-                    discharged = True
-                elif p0 > self.t_high and self._l2_ready(sess):
-                    # obvious artifact: skip L1, go straight to the identity check
+                p1 = _timed("l1", lambda: self.l1.prob_fake(wav, SR))
+                if sess.hot and self._l2_ready(sess):
                     sim = _timed("l2", lambda: self._verify(wav, sess))
-                    prob, level = combine_l2(p0, sim), 2
+                    prob, level = combine_l2(p1, sim), 2
                 else:
-                    p1 = _timed("l1", lambda: self.l1.prob_fake(wav, SR))
-                    if sess.hot and self._l2_ready(sess):
-                        sim = _timed("l2", lambda: self._verify(wav, sess))
-                        prob, level = combine_l2(p1, sim), 2
-                    else:
-                        prob, level = p1, 1
+                    prob, level = p1, 1
         else:
-            # kill switch: flat pipeline, L0 bypassed, L1 always-on
+            # kill switch: flat pipeline, L0 CLASSIFIER bypassed, L1 always-on.
+            # (The VAD gate above still applies -- it is not part of L0.)
             p1 = _timed("l1", lambda: self.l1.prob_fake(wav, SR))
             if sess.hot and self._l2_ready(sess):
                 sim = _timed("l2", lambda: self._verify(wav, sess))
@@ -582,7 +588,7 @@ class Cascade:
                 continue
             try:
                 # probe.json's exact recipe: whole file in; score_waves centre-
-                # crops to crop_s. This is NOT the live 3 s window path.
+                # crops to crop_s. This is NOT the live window path.
                 p = float(self.l1.prob_fake(read_audio(str(path))))
             except Exception as exc:  # noqa: BLE001 - never let a probe stop startup
                 log.critical("PROBE: %s clip %s failed to score (%s) - skipping",

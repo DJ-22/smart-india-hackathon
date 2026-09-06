@@ -74,7 +74,12 @@ L1_RED: float = _env_float("L1_RED", 0.825)
 EMA_ALPHA: float = _env_float("EMA_ALPHA", 0.35)  # for the UI's use; server never smooths
 HYSTERESIS_CLEAN_WINDOWS: int = _env_int("HYSTERESIS_CLEAN_WINDOWS", 10)
 MIN_SPEECH_RATIO: float = _env_float("MIN_SPEECH_RATIO", 0.30)
-WINDOW_S: float = _env_float("WINDOW_S", 3.0)
+# 4.0 to match the L1 model's crop_s (ml.config.CROP_S). L1Scorer._prep feeds
+# every window through crop_or_pad, which RIGHT-PADS anything shorter than
+# crop_s with zeros -- a 3 s window arrived at the transformer as 3 s of speech
+# + 1 s of digital silence it never saw in training. Matching the window to
+# crop_s removes that dead 25%. HOP_S stays 1.0 (stride is independent of length).
+WINDOW_S: float = _env_float("WINDOW_S", 4.0)
 HOP_S: float = _env_float("HOP_S", 1.0)
 TARGET_SR: int = _env_int("TARGET_SR", 16000)
 # False = L1 always-on, flat pipeline. False is the measured default, not a
