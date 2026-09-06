@@ -19,14 +19,27 @@ The RiskEngine does NOT:
     - perform audio processing
 """
 
+import sys
 from datetime import datetime
+from pathlib import Path
 
-# Risk configuration
-L1_AMBER = 0.45
-L1_RED = 0.75
-EMA_ALPHA = 0.35
-HYSTERESIS_CLEAN_WINDOWS = 10
-MIN_SPEECH_RATIO = 0.30
+# The calibrated thresholds live in common/config.py -- measured on the real
+# model, not guessed. Import them; never hardcode. At the old placeholder
+# L1_AMBER = 0.45 a genuine human speaker (raw prob_fake peaks ~0.55 live)
+# trips the alert on stage. Ensure repo root is importable here regardless of
+# how the dashboard is launched: this module may be imported before
+# dashboard.py has extended sys.path.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from common.config import (
+    L1_AMBER,
+    L1_RED,
+    EMA_ALPHA,
+    HYSTERESIS_CLEAN_WINDOWS,
+    MIN_SPEECH_RATIO,
+)
 
 class RiskEngine:
 

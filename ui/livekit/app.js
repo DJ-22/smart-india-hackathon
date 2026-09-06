@@ -736,14 +736,39 @@ async function connectToRoom() {
 
         /* ----------------------------------------------------
            Enable microphone
+
+           The operator's monitor view connects with a
+           subscribe-only token (publish=false), so enabling
+           the mic will reject. That is expected: stay
+           connected as a listener and disable the mute
+           control instead of failing the whole connection.
+           A caller who opens this page with a publish token
+           enables the mic normally.
            ---------------------------------------------------- */
 
-        await room.localParticipant
-            .setMicrophoneEnabled(
-                true
+        try {
+
+            await room.localParticipant
+                .setMicrophoneEnabled(
+                    true
+                );
+
+            microphoneEnabled = true;
+
+        } catch (micError) {
+
+            console.warn(
+                "Microphone unavailable (viewer/monitor mode):",
+                micError
             );
 
-        microphoneEnabled = true;
+            microphoneEnabled = false;
+
+            if (muteButton) {
+                muteButton.disabled = true;
+                muteButton.textContent = "🔇 Monitor";
+            }
+        }
 
 
         /* ----------------------------------------------------
