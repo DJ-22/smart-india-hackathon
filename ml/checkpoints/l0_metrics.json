@@ -1,0 +1,22 @@
+{
+  "val_eer": 0.26086956521739135,
+  "val_auc": 0.828160564793025,
+  "xling_eer": 0.304101400933956,
+  "xling_auc": 0.7837931954636423,
+  "t_low": 0.03424308808556539,
+  "t_low_discharge": 0.08592132505175987,
+  "t_low_recall_fake": 0.9906832298136646,
+  "t_low_found": true,
+  "t_high": 0.9973878624499063,
+  "t_high_precision": 0.993006993006993,
+  "t_high_frac": 0.07401656314699794,
+  "t_high_found": true,
+  "l1_skipped_frac": 0.15993788819875782,
+  "recommend_cascade_enabled": true,
+  "ablation": {
+    "clean_fit_eer_on_codec_val": 0.27846790890269146
+  },
+  "n_train": 11061,
+  "n_val": 1932,
+  "n_xling": 2999
+}
