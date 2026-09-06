@@ -134,9 +134,9 @@ def test_l2_runs_when_hot_and_enrolled() -> None:
 
 
 def test_straight_to_l2_on_obvious_artifact() -> None:
-    c = Cascade(manifest_path=NO_MANIFEST, l2_enabled=True)
+    c = Cascade(manifest_path=NO_MANIFEST, cascade_enabled=True, l2_enabled=True)
     c.enroll("s", _enroll_audio())
-    c.l0 = _FixedL0(0.95)  # p0 > T_HIGH: skip L1, go straight to identity check
+    c.l0 = _FixedL0(0.999)  # p0 > T_HIGH (0.9974): skip L1, go straight to identity check
     ws = c.score(_speech(), "s", 0.0, 0)
     assert ws.level_resolved == 2
     assert ws.speaker_sim is not None
@@ -152,20 +152,20 @@ def test_no_enrollment_means_no_l2() -> None:
     assert ws.speaker_sim is None
 
 
-def test_hysteresis_cooldown() -> None:
+def test_hot_latches_with_zero_t_low() -> None:
     c = Cascade(manifest_path=NO_MANIFEST, l2_enabled=True)
     c.enroll("s", _enroll_audio())
     c._session("s").hot = True
-    # clean SPEECH windows (discharged at L0, non-gated) cool the session;
-    # silence no longer counts (see test_gated_silence_does_not_cool)
-    for i in range(config.HYSTERESIS_CLEAN_WINDOWS):
-        assert c._session("s").hot, f"cooled too early at window {i}"
+    # Cooldown only counts windows scoring below T_LOW, and the calibrated
+    # default is T_LOW=0.0 (discharge off), which no score can fall under. So a
+    # hot session never cools on its own -- it stays hot for the rest of the call.
+    for i in range(config.HYSTERESIS_CLEAN_WINDOWS + 2):
         c.score(_speech(), "s", float(i), i)
-    assert not c._session("s").hot, "session must cool after N clean speech windows"
+        assert c._session("s").hot, f"hot must latch under T_LOW=0.0 (window {i})"
 
 
 def test_gated_silence_does_not_cool() -> None:
-    c = Cascade(manifest_path=NO_MANIFEST, l2_enabled=True)
+    c = Cascade(manifest_path=NO_MANIFEST, cascade_enabled=True, l2_enabled=True)
     c.enroll("s", _enroll_audio())
     c._session("s").hot = True
     c._session("s").clean_streak = 3
@@ -331,7 +331,7 @@ def test_combine_rule() -> None:
 
 
 def test_metrics_shape() -> None:
-    c = Cascade(manifest_path=NO_MANIFEST)
+    c = Cascade(manifest_path=NO_MANIFEST, cascade_enabled=True)
     c.score(_speech(), "s", 0.0, 0)
     m = c.metrics()
     assert set(m) >= {"per_level_counts", "latency", "stage_latency",
@@ -343,14 +343,15 @@ def test_metrics_shape() -> None:
 
 
 def test_metrics_splits_gated_from_discharged() -> None:
-    c = Cascade(manifest_path=NO_MANIFEST)
-    c.score(_speech(), "s", 0.0, 0)   # clean speech -> discharged at L0
+    c = Cascade(manifest_path=NO_MANIFEST, cascade_enabled=True)
+    c.score(_speech(), "s", 0.0, 0)   # speech -> scored at L1 (T_LOW=0.0: no L0 discharge)
     c.score(_silence(), "s", 1.0, 1)  # silence -> VAD-gated
     m = c.metrics()
     assert m["vad_gated"] == 1
-    assert m["l0_discharged"] == 1
-    # discharge_rate is over NON-gated windows only: 1 discharged / 1 non-gated
-    assert m["discharge_rate"] == 1.0
+    # T_LOW=0.0 closes the L0 discharge route, so nothing discharges
+    assert m["l0_discharged"] == 0
+    # discharge_rate is over NON-gated windows only: 0 discharged / 1 non-gated
+    assert m["discharge_rate"] == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +368,7 @@ def test_route_t_low_zero_nothing_discharges() -> None:
 
 
 def test_route_t_high_zero_skips_l1_straight_to_l2() -> None:
-    c = Cascade(manifest_path=NO_MANIFEST, l2_enabled=True)
+    c = Cascade(manifest_path=NO_MANIFEST, cascade_enabled=True, l2_enabled=True)
     c.enroll("s", _enroll_audio())
     c.t_high = 0.0  # every p0 exceeds it: obvious-artifact route
     c.t_low = -1.0  # and the discharge route is closed
@@ -394,7 +395,7 @@ def test_route_t_high_zero_without_enrollment_falls_to_l1() -> None:
 
 
 def test_hot_stickiness_survives_clean_windows() -> None:
-    c = Cascade(manifest_path=NO_MANIFEST, l2_enabled=True)
+    c = Cascade(manifest_path=NO_MANIFEST, cascade_enabled=True, l2_enabled=True)
     c.enroll("s", _enroll_audio())
     c.t_high = 0.0
     c.t_low = -1.0  # close the discharge route so p0 reaches the T_HIGH check
@@ -403,13 +404,11 @@ def test_hot_stickiness_survives_clean_windows() -> None:
     assert c._session("s").hot
     c.t_high = config.T_HIGH  # restore: subsequent windows score normally
     c.t_low = config.T_LOW
-    # N-1 clean SPEECH windows (discharged, non-gated): must STILL be hot
-    for i in range(config.HYSTERESIS_CLEAN_WINDOWS - 1):
+    # Under the calibrated default (T_LOW=0.0) cooldown can never fire, so the
+    # session stays hot through every subsequent clean window -- no cooling.
+    for i in range(config.HYSTERESIS_CLEAN_WINDOWS + 2):
         c.score(_speech(), "s", float(i + 1), i + 1)
-        assert c._session("s").hot, f"cooled too early, after {i + 1} clean windows"
-    # the Nth clean window finally cools it
-    c.score(_speech(), "s", 99.0, 99)
-    assert not c._session("s").hot
+        assert c._session("s").hot, f"must stay hot under T_LOW=0.0 (window {i + 1})"
 
 
 # ---------------------------------------------------------------------------

@@ -54,15 +54,32 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
-T_LOW: float = _env_float("T_LOW", 0.15)
-T_HIGH: float = _env_float("T_HIGH", 0.85)
+# T_LOW is 0.0 on purpose: the discharge path works (8.6% of windows at 99% fake
+# recall) but a discharged window reports L0's score instead of L1's, which cost
+# 2.0 points of val EER (4.66% -> 6.63%) to save 8.6% of a 14 ms transformer.
+# The T_HIGH fast-track costs 0.05 points and is kept. calibrate.py re-measures
+# both paths every run and switches off whichever fails to pay for itself.
+T_LOW: float = _env_float("T_LOW", 0.0)        # L0 below this -> resolved real, stop (0.0 = discharge off)
+T_HIGH: float = _env_float("T_HIGH", 0.9974)   # L0 above this -> skip L1, go straight to L2
+# Bands apply to the EMA-smoothed score in ui/risk.py, and were calibrated on
+# simulated 12-window calls: RED flags 98.0% of spoofed calls at a 0.7% false
+# alarm rate on genuine ones; AMBER 99.7% at 1.3%.
+L1_AMBER: float = _env_float("L1_AMBER", 0.645)
+L1_RED: float = _env_float("L1_RED", 0.825)
 EMA_ALPHA: float = _env_float("EMA_ALPHA", 0.35)  # for the UI's use; server never smooths
 HYSTERESIS_CLEAN_WINDOWS: int = _env_int("HYSTERESIS_CLEAN_WINDOWS", 10)
 MIN_SPEECH_RATIO: float = _env_float("MIN_SPEECH_RATIO", 0.30)
 WINDOW_S: float = _env_float("WINDOW_S", 3.0)
 HOP_S: float = _env_float("HOP_S", 1.0)
 TARGET_SR: int = _env_int("TARGET_SR", 16000)
-CASCADE_ENABLED: bool = _env_bool("CASCADE_ENABLED", True)
+# False = L1 always-on, flat pipeline. False is the measured default, not a
+# retreat: L0 costs ~13 ms/window and L1 ~14 ms on this GPU, so gating the
+# transformer behind the gate costs ~27 ms to save ~1 ms of transformer on the
+# 7.4% of windows T_HIGH fast-tracks. The cascade is the right architecture
+# where L1 is genuinely the bottleneck -- CPU-only inference, or many concurrent
+# calls sharing one GPU -- and both levels stay wired so flipping this to True
+# is a one-line demo. See the Latency section of RESULTS.md.
+CASCADE_ENABLED: bool = _env_bool("CASCADE_ENABLED", False)
 L2_ENABLED: bool = _env_bool("L2_ENABLED", True)
 # Real mode by default (stub is opt-in); .env or a shell var can override.
 STUB_MODE: bool = _env_bool("STUB_MODE", False)
@@ -88,6 +105,6 @@ if __name__ == "__main__":
     ]
     for n in names:
         print(f"{n} = {globals()[n]!r}  (source: {source_of(n)})")
-    assert T_LOW < T_HIGH, "T_LOW must be below T_HIGH"
+    assert T_LOW <= T_HIGH, "T_LOW must not exceed T_HIGH"
     assert 0 < HOP_S <= WINDOW_S, "HOP_S must be positive and <= WINDOW_S"
     print("config self-test PASS")
