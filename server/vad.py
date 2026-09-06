@@ -56,7 +56,9 @@ class _SileroVAD:
             try:
                 import torch
 
-                torch.set_num_threads(1)
+                # NOTE: do NOT cap torch threads here. set_num_threads is
+                # process-global and would throttle the real wav2vec2/ECAPA
+                # models too (~2.6x slower measured). Silero does not need it.
                 model, _utils = torch.hub.load(
                     "snakers4/silero-vad", "silero_vad", trust_repo=True
                 )

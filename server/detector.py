@@ -39,6 +39,24 @@ log = logging.getLogger("server.detector")
 SR = config.TARGET_SR
 
 
+class ConfigError(ValueError):
+    """An incoherent config (e.g. T_LOW > T_HIGH). Must stop the server
+    loudly - never degrade to stub, which would serve random numbers."""
+
+
+class EnrollmentError(ValueError):
+    """A rejected enrollment (too short/long, or silence). Maps to HTTP 400."""
+
+
+class AudioDecodeError(ValueError):
+    """Body could not be decoded as usable audio. Maps to HTTP 400."""
+
+
+ENROLL_MIN_S = 4.0
+ENROLL_MAX_S = 30.0
+_EMBED_EPS = 1e-6
+
+
 def combine_l2(p_detect: float, speaker_sim: float) -> float:
     """L2 fusion: flag on artifact evidence OR identity mismatch.
     Deliberately simple and in one place so it's easy to change."""
@@ -181,7 +199,7 @@ class RealL2:
 
         self._torch = torch
         self._enc = EncoderClassifier.from_hparams(
-            source=source, savedir="ml/checkpoints/ecapa"
+            source=source, savedir=config.ECAPA_SAVEDIR
         )
 
     def embed(self, wav: np.ndarray, sr: int = SR) -> np.ndarray:
@@ -212,11 +230,27 @@ class Cascade:
 
         manifest = self._read_manifest(manifest_path)
         thresholds = manifest.get("thresholds", manifest)
-        self.t_low = float(thresholds.get("t_low", config.T_LOW))
-        self.t_high = float(thresholds.get("t_high", config.T_HIGH))
-        self.min_speech_ratio = float(thresholds.get("min_speech_ratio", config.MIN_SPEECH_RATIO))
-        self.hysteresis_clean_windows = int(
-            thresholds.get("hysteresis_clean_windows", config.HYSTERESIS_CLEAN_WINDOWS))
+        if not isinstance(thresholds, dict):
+            log.warning("manifest 'thresholds' is not an object (%s); using config defaults",
+                        type(thresholds).__name__)
+            thresholds = {}
+
+        def _num(key: str, default: Any, cast: type) -> Any:
+            # A hand-edited manifest with a bad value must fall back to the
+            # config default (naming the key), not crash the whole cascade.
+            try:
+                return cast(thresholds.get(key, default))
+            except (TypeError, ValueError):
+                log.warning("manifest threshold %r invalid (%r); using default %r",
+                            key, thresholds.get(key), default)
+                return default
+
+        self.t_low = _num("t_low", config.T_LOW, float)
+        self.t_high = _num("t_high", config.T_HIGH, float)
+        self.min_speech_ratio = _num("min_speech_ratio", config.MIN_SPEECH_RATIO, float)
+        self.hysteresis_clean_windows = _num(
+            "hysteresis_clean_windows", config.HYSTERESIS_CLEAN_WINDOWS, int)
+        self._validate_thresholds()
 
         self.l0 = self._load_level("L0", manifest.get("l0_path"), RealL0, StubL0)
         self.l1 = self._load_level("L1", manifest.get("l1_path"), RealL1, StubL1)
@@ -238,6 +272,9 @@ class Cascade:
         self._lock = threading.Lock()
         self._sessions: Dict[str, _SessionState] = {}
         self._latencies: Dict[int, List[int]] = {0: [], 1: [], 2: []}
+        # level-0 splits into two very different outcomes; count them apart
+        self._gated = 0          # VAD-gated: too little speech to score
+        self._l0_discharged = 0  # actually reached L0 and cleared as real
         # per-stage wall time, so VAD cost is visible separately from the
         # L0 classifier (the ~4ms architecture budget is for L0 alone)
         self._stage_latencies: Dict[str, List[float]] = {
@@ -246,6 +283,20 @@ class Cascade:
         self._warmup()
 
     # -- construction helpers ------------------------------------------------
+    def _validate_thresholds(self) -> None:
+        """Stop the server loudly on an incoherent config rather than
+        silently flatlining the dashboard (e.g. MIN_SPEECH_RATIO=1.5)."""
+        if not (0.0 <= self.t_low <= self.t_high <= 1.0):
+            raise ConfigError(
+                f"threshold invariant violated: need 0 <= T_LOW <= T_HIGH <= 1, "
+                f"got T_LOW={self.t_low}, T_HIGH={self.t_high}")
+        if not (0.0 <= self.min_speech_ratio <= 1.0):
+            raise ConfigError(
+                f"MIN_SPEECH_RATIO must be in [0, 1], got {self.min_speech_ratio}")
+        if self.hysteresis_clean_windows <= 0:
+            raise ConfigError(
+                f"HYSTERESIS_CLEAN_WINDOWS must be > 0, got {self.hysteresis_clean_windows}")
+
     @staticmethod
     def _read_manifest(path: str) -> Dict[str, Any]:
         p = Path(path)
@@ -299,15 +350,38 @@ class Cascade:
             return self._sessions.setdefault(sid, _SessionState())
 
     def reset_session(self, sid: str) -> None:
+        """Clear runtime state (hot flag, clean streak) but KEEP the enrolled
+        voiceprint - a UI 'clear chart' must not silently disable L2. Use
+        unenroll() to drop the voiceprint on purpose."""
         with self._lock:
-            self._sessions.pop(sid, None)
+            s = self._sessions.get(sid)
+            if s is not None:
+                s.hot = False
+                s.clean_streak = 0
+
+    def unenroll(self, sid: str) -> None:
+        with self._lock:
+            s = self._sessions.get(sid)
+            if s is not None:
+                s.embedding = None
 
     def enroll(self, sid: str, wav: np.ndarray, sr: int = SR) -> float:
         wav = np.asarray(wav, dtype=np.float32).ravel()
+        duration = len(wav) / sr
+        if duration < ENROLL_MIN_S:
+            raise EnrollmentError(
+                f"clip too short: {duration:.1f}s, need {ENROLL_MIN_S:.0f}-{ENROLL_MAX_S:.0f}s")
+        if duration > ENROLL_MAX_S:
+            raise EnrollmentError(
+                f"clip too long: {duration:.1f}s, need {ENROLL_MIN_S:.0f}-{ENROLL_MAX_S:.0f}s")
         emb = self.l2.embed(wav, sr)
+        if float(np.linalg.norm(emb)) < _EMBED_EPS:
+            raise EnrollmentError("clip appears to be silence (no usable voiceprint)")
+        if self._session(sid).embedding is not None:
+            log.warning("re-enrolling session %s: replacing existing voiceprint", sid)
         self._session(sid).embedding = emb
-        log.info("enrolled voiceprint for session %s (%.1fs of audio)", sid, len(wav) / sr)
-        return len(wav) / sr
+        log.info("enrolled voiceprint for session %s (%.1fs of audio)", sid, duration)
+        return duration
 
     def _l2_ready(self, sess: _SessionState) -> bool:
         return self.l2_enabled and sess.embedding is not None
@@ -328,14 +402,18 @@ class Cascade:
 
         speech = _timed("vad", lambda: vad.speech_ratio(wav, SR))
         sim: Optional[float] = None
+        gated = False
+        discharged = False
 
         if self.cascade_enabled:
             if speech < self.min_speech_ratio:
                 prob, level = 0.0, 0  # not enough speech: never touch a model
+                gated = True
             else:
                 p0 = _timed("l0", lambda: self.l0.prob_fake(wav, SR))
                 if p0 < self.t_low:
                     prob, level = p0, 0  # discharged as obviously real
+                    discharged = True
                 elif p0 > self.t_high and self._l2_ready(sess):
                     # obvious artifact: skip L1, go straight to the identity check
                     sim = _timed("l2", lambda: self._verify(wav, sess))
@@ -356,10 +434,17 @@ class Cascade:
             else:
                 prob, level = p1, 1
 
-        self._update_hysteresis(sess, prob, level)
+        # VAD-gated windows carry no evidence about the speaker, so they must
+        # NOT move the hysteresis streak - a suspect going silent must not cool.
+        if not gated:
+            self._update_hysteresis(sess, prob, level)
         latency_ms = int((time.perf_counter() - t0) * 1000)
         with self._lock:
             self._latencies[level].append(latency_ms)
+            if gated:
+                self._gated += 1
+            elif discharged:
+                self._l0_discharged += 1
             for stage, ms in stage_ms.items():
                 self._stage_latencies[stage].append(ms)
 
@@ -410,16 +495,23 @@ class Cascade:
         with self._lock:
             counts = {f"level_{lvl}": len(v) for lvl, v in self._latencies.items()}
             total = sum(counts.values())
+            gated = self._gated
+            discharged = self._l0_discharged
             lat = {f"level_{lvl}": self._pctl_summary(vals)
                    for lvl, vals in self._latencies.items() if vals}
             stage_lat = {stage: self._pctl_summary(vals)
                          for stage, vals in self._stage_latencies.items() if vals}
             hot = sum(1 for s in self._sessions.values() if s.hot)
+        non_gated = total - gated  # windows that actually reached L0
         return {
             "per_level_counts": counts,
             "latency": lat,
             "stage_latency": stage_lat,  # VAD cost vs each classifier, separately
-            "discharge_rate": round(counts["level_0"] / total, 3) if total else None,
+            "vad_gated": gated,          # too little speech to score
+            "l0_discharged": discharged,  # reached L0 and cleared as real
+            # discharge rate over NON-gated windows only (the stat Daksh tunes
+            # the >=0.99-recall gate against); gated windows no longer inflate it
+            "discharge_rate": round(discharged / non_gated, 3) if non_gated else None,
             "hot_sessions": hot,
             "level_versions": [self.l0.version, self.l1.version, self.l2.version],
             "cascade_enabled": self.cascade_enabled,
@@ -430,22 +522,38 @@ class Cascade:
 # --------------------------------------------------------------------------
 # bytes-level adapter used by server/app.py real mode
 # --------------------------------------------------------------------------
+MIN_DECODE_SAMPLES = int(0.1 * SR)  # below ~0.1s a /score body is garbage, not a window
+
+
 def decode_wav(wav_bytes: bytes) -> np.ndarray:
-    """WAV bytes -> float32 mono at TARGET_SR. Falls back to interpreting
-    the payload as raw 16 kHz mono int16 if it isn't a parseable WAV."""
-    try:
-        with wave_mod.open(io.BytesIO(wav_bytes)) as w:
-            sr, ch, width = w.getframerate(), w.getnchannels(), w.getsampwidth()
-            raw = w.readframes(w.getnframes())
-        if width != 2:
-            raise ValueError(f"unsupported sample width {width}")
-        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-        if ch > 1:
-            audio = audio.reshape(-1, ch).mean(axis=1)
-    except Exception:
+    """WAV bytes -> float32 mono at TARGET_SR.
+
+    A RIFF/WAV body that cannot be parsed to 16-bit PCM (24-bit, float,
+    corrupt) is REJECTED with AudioDecodeError, never silently reinterpreted
+    as raw samples. Only a non-RIFF body falls back to raw 16k mono int16
+    (kept for backward compat). Either way, a result too short to be a real
+    window is rejected - this is what turns a stray JSON body into a 400."""
+    if wav_bytes[:4] == b"RIFF":
+        try:
+            with wave_mod.open(io.BytesIO(wav_bytes)) as w:
+                sr, ch, width = w.getframerate(), w.getnchannels(), w.getsampwidth()
+                raw = w.readframes(w.getnframes())
+            if width != 2:
+                raise ValueError(f"{width * 8}-bit samples (need 16-bit PCM)")
+            audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            if ch > 1:
+                audio = audio.reshape(-1, ch).mean(axis=1)
+        except Exception as exc:  # noqa: BLE001 - a bad RIFF is a client error
+            raise AudioDecodeError(f"unparseable WAV: {exc}") from exc
+    else:
         audio = np.frombuffer(wav_bytes[: len(wav_bytes) // 2 * 2],
                               dtype=np.int16).astype(np.float32) / 32768.0
         sr = SR
+    if audio.size < MIN_DECODE_SAMPLES:
+        raise AudioDecodeError(
+            f"decoded audio too short: {audio.size} samples "
+            f"({audio.size / max(sr, 1):.3f}s at {sr} Hz), "
+            f"need >= {MIN_DECODE_SAMPLES / SR:.2f}s")
     if sr != SR:
         from scipy.signal import resample_poly
 
@@ -471,6 +579,9 @@ class CascadeScorer:
 
     def reset_session(self, session_id: str) -> None:
         self.cascade.reset_session(session_id)
+
+    def unenroll(self, session_id: str) -> None:
+        self.cascade.unenroll(session_id)
 
     def metrics_extra(self) -> Dict[str, Any]:
         return {"cascade": self.cascade.metrics()}

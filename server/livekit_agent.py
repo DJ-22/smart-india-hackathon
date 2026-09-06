@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import aiohttp
 import numpy as np
 
-from common.config import TARGET_SR
+from common.config import HOP_S, TARGET_SR
 from server.chunker import RingChunker
 
 log = logging.getLogger("server.livekit_agent")
@@ -150,6 +150,9 @@ class ScoringAgent:
             pass
         finally:
             await stream.aclose()
+            # Drop the stale partial buffer so a rejoin with the same identity
+            # doesn't stitch pre-gap and post-gap audio into one seam window.
+            st.chunker.reset()
             log.info("audio stream for %r ended", identity)
 
     # -- scores out ----------------------------------------------------------
@@ -161,12 +164,16 @@ class ScoringAgent:
                 async with self.http.post(
                     f"{self.server_url}/score",
                     data=to_wav_bytes(window),
+                    # Send the true window id/time so a dropped POST cannot
+                    # shift every later timestamp on the server.
                     headers={"X-Session-Id": identity,
+                             "X-Window-Id": str(window_id),
+                             "X-T-Start": repr(window_id * HOP_S),
                              "Content-Type": "application/octet-stream"},
                 ) as resp:
                     if resp.status != 200:
-                        log.warning("/score HTTP %d for %r window %d: %s",
-                                    resp.status, identity, window_id,
+                        log.warning("DROPPING window %d for %r: /score returned HTTP %d: %s",
+                                    window_id, identity, resp.status,
                                     (await resp.text())[:200])
                         continue
                     body = await resp.json()
@@ -177,9 +184,9 @@ class ScoringAgent:
                     log.info("FIRST SCORE for session %r: %s", identity, body)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001 - keep serving
-                log.warning("score POST failed for %r window %d: %s",
-                            identity, window_id, exc)
+            except Exception as exc:  # noqa: BLE001 - keep serving, never retry
+                log.warning("DROPPING window %d for %r: score POST failed: %s",
+                            window_id, identity, exc)
             finally:
                 self.queue.task_done()
 

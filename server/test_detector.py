@@ -111,7 +111,7 @@ def test_kill_switch_cascade_disabled_runs_flat() -> None:
 
 def test_kill_switch_l2_disabled() -> None:
     c = Cascade(manifest_path=NO_MANIFEST, l2_enabled=False)
-    c.enroll("s", _speech())  # even enrolled, L2 must never run
+    c.enroll("s", _enroll_audio())  # even enrolled, L2 must never run
     c._session("s").hot = True
     for wav in (_speech(), _noise()):
         ws = c.score(wav, "s", 0.0, 0)
@@ -122,20 +122,20 @@ def test_kill_switch_l2_disabled() -> None:
 
 def test_l2_runs_when_hot_and_enrolled() -> None:
     c = Cascade(manifest_path=NO_MANIFEST, l2_enabled=True)
-    c.enroll("s", _speech())
+    c.enroll("s", _enroll_audio())
     c._session("s").hot = True
     c.l0 = _FixedL0(0.5)  # mid-band: route L1, then L2 because hot+enrolled
     ws = c.score(_speech(), "s", 0.0, 0)
     assert ws.level_resolved == 2
     assert ws.speaker_sim is not None
     assert 0.0 <= ws.speaker_sim <= 1.0
-    # same audio vs its own enrollment should look similar
+    # same speaker vs its own enrollment should look similar
     assert ws.speaker_sim > 0.5
 
 
 def test_straight_to_l2_on_obvious_artifact() -> None:
     c = Cascade(manifest_path=NO_MANIFEST, l2_enabled=True)
-    c.enroll("s", _speech())
+    c.enroll("s", _enroll_audio())
     c.l0 = _FixedL0(0.95)  # p0 > T_HIGH: skip L1, go straight to identity check
     ws = c.score(_speech(), "s", 0.0, 0)
     assert ws.level_resolved == 2
@@ -154,22 +154,174 @@ def test_no_enrollment_means_no_l2() -> None:
 
 def test_hysteresis_cooldown() -> None:
     c = Cascade(manifest_path=NO_MANIFEST, l2_enabled=True)
-    c.enroll("s", _speech())
+    c.enroll("s", _enroll_audio())
     c._session("s").hot = True
-    c.score(_speech(), "s", 0.0, 0)  # runs L2, stays hot
-    assert c._session("s").hot
+    # clean SPEECH windows (discharged at L0, non-gated) cool the session;
+    # silence no longer counts (see test_gated_silence_does_not_cool)
     for i in range(config.HYSTERESIS_CLEAN_WINDOWS):
-        c.score(_silence(), "s", float(i), i)  # gated windows: prob 0.0 = clean
-    assert not c._session("s").hot, "session must cool after N clean windows"
+        assert c._session("s").hot, f"cooled too early at window {i}"
+        c.score(_speech(), "s", float(i), i)
+    assert not c._session("s").hot, "session must cool after N clean speech windows"
+
+
+def test_gated_silence_does_not_cool() -> None:
+    c = Cascade(manifest_path=NO_MANIFEST, l2_enabled=True)
+    c.enroll("s", _enroll_audio())
+    c._session("s").hot = True
+    c._session("s").clean_streak = 3
+    # a suspect going silent must NOT de-escalate: gated windows leave the
+    # streak and hot flag untouched, no matter how many
+    for i in range(2 * config.HYSTERESIS_CLEAN_WINDOWS):
+        ws = c.score(_silence(), "s", float(i), i)
+        assert ws.level_resolved == 0 and ws.speech_ratio < c.min_speech_ratio
+    assert c._session("s").hot, "gated silence must not cool a hot session"
+    assert c._session("s").clean_streak == 3, "gated windows must not touch the streak"
 
 
 def test_reset_session() -> None:
     c = Cascade(manifest_path=NO_MANIFEST)
-    c.enroll("s", _speech())
+    c.enroll("s", _enroll_audio())
     c._session("s").hot = True
+    c._session("s").clean_streak = 5
     c.reset_session("s")
     st = c._session("s")
-    assert not st.hot and st.embedding is None
+    assert not st.hot and st.clean_streak == 0
+    assert st.embedding is not None, "reset must KEEP the voiceprint (not disable L2)"
+    c.unenroll("s")  # dropping the voiceprint is a separate, explicit action
+    assert c._session("s").embedding is None
+
+
+def test_enroll_validation() -> None:
+    from server.detector import ENROLL_MIN_S, EnrollmentError
+
+    c = Cascade(manifest_path=NO_MANIFEST, l2_enabled=True)
+    # too short (3s < 4s), too long (40s), and silence must all be rejected
+    for bad, why in ((_speech(), "too short"),
+                     (np.tile(_enroll_audio(), 6), "too long"),
+                     (np.zeros(int(8 * SR), dtype=np.float32), "silence")):
+        try:
+            c.enroll("s", bad)
+            assert False, f"expected rejection for {why}"
+        except EnrollmentError:
+            pass
+    assert c._session("s").embedding is None, "no bad clip should have enrolled"
+    # a valid clip enrolls
+    dur = c.enroll("s", _enroll_audio())
+    assert dur >= ENROLL_MIN_S
+    assert c._session("s").embedding is not None
+
+
+def test_reenroll_replaces_and_warns(capfd=None) -> None:
+    c = Cascade(manifest_path=NO_MANIFEST, l2_enabled=True)
+    c.enroll("s", _enroll_audio())
+    first = c._session("s").embedding
+    c.enroll("s", _enroll_audio())  # second enroll: must warn (see logs) + replace
+    assert c._session("s").embedding is not None
+    # replacement occurred without error; embedding still present
+    assert first is not None
+
+
+def test_decode_rejects_garbage_and_bad_wav() -> None:
+    import io as _io
+
+    from server.detector import AudioDecodeError
+
+    # non-RIFF JSON: raw fallback yields too few samples -> rejected
+    try:
+        decode_wav(b'{"session": "oops", "not": "audio"}')
+        assert False, "JSON body should be rejected"
+    except AudioDecodeError:
+        pass
+    # RIFF but 24-bit: must reject, not reinterpret as raw
+    buf = _io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(3)  # 24-bit
+        w.setframerate(SR)
+        w.writeframes(b"\x00\x01\x02" * SR)
+    try:
+        decode_wav(buf.getvalue())
+        assert False, "24-bit WAV should be rejected"
+    except AudioDecodeError:
+        pass
+    # a valid 16-bit mono WAV still decodes fine (no regression)
+    good = _io.BytesIO()
+    with wave.open(good, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SR)
+        w.writeframes((_speech() * 32767).astype(np.int16).tobytes())
+    decoded = decode_wav(good.getvalue())
+    assert len(decoded) == len(_speech())
+
+
+def test_decode_stereo_and_resample_still_work() -> None:
+    import io as _io
+
+    # stereo 16-bit at 48k: valid, must downmix + resample, not be rejected
+    n = 48000
+    stereo = np.zeros((n, 2), dtype=np.int16)
+    stereo[:, 0] = (np.sin(2 * np.pi * 200 * np.arange(n) / 48000) * 8000).astype(np.int16)
+    stereo[:, 1] = stereo[:, 0]
+    buf = _io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(48000)
+        w.writeframes(stereo.reshape(-1).tobytes())
+    decoded = decode_wav(buf.getvalue())
+    assert abs(len(decoded) - SR) < 100, "48k->16k of 1s should be ~16000 samples"
+
+
+def test_window_id_headers_prevent_timeline_shift() -> None:
+    import io as _io
+
+    from fastapi.testclient import TestClient
+
+    from server import app as appmod
+
+    client = TestClient(appmod.app)
+    good = _io.BytesIO()
+    with wave.open(good, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SR)
+        w.writeframes((_speech() * 32767).astype(np.int16).tobytes())
+    wav = good.getvalue()
+
+    def post(window_id):
+        return client.post("/score", content=wav, headers={
+            "X-Session-Id": "drift", "X-Window-Id": str(window_id),
+            "X-T-Start": repr(window_id * config.HOP_S)}).json()
+
+    r0 = post(0)          # window 0 (t=0)
+    # window 1 "dropped" (never posted); window 2 arrives next
+    r2 = post(2)          # window 2 (t=2s), NOT the 2nd arrival
+    assert r0["window_id"] == 0 and r0["t_start"] == 0.0
+    assert r2["window_id"] == 2, "server must honor the agent's window id"
+    assert r2["t_start"] == 2 * config.HOP_S, "audio from t=2s must be labeled t=2s"
+
+    # without headers, the server falls back to its arrival counter
+    r_a = client.post("/score", content=wav, headers={"X-Session-Id": "count"}).json()
+    r_b = client.post("/score", content=wav, headers={"X-Session-Id": "count"}).json()
+    assert (r_a["window_id"], r_b["window_id"]) == (0, 1)
+
+
+def test_malformed_manifest_falls_back_to_defaults(tmp_path=None) -> None:
+    import json as _json
+    import tempfile
+
+    # valid JSON, bad threshold value: must NOT crash the cascade
+    d = tempfile.mkdtemp()
+    mpath = Path(d) / "MANIFEST.json"
+    mpath.write_text(_json.dumps({"thresholds": {"t_low": "abc"}, "model_version": "x"}))
+    c = Cascade(manifest_path=str(mpath))
+    assert c.t_low == config.T_LOW, "bad t_low must fall back to config default"
+    assert c.model_version == "x", "the rest of the manifest still applies"
+    # thresholds as a non-object: also tolerated
+    mpath.write_text(_json.dumps({"thresholds": "0.2"}))
+    c2 = Cascade(manifest_path=str(mpath))
+    assert c2.t_low == config.T_LOW
 
 
 def test_combine_rule() -> None:
@@ -188,6 +340,17 @@ def test_metrics_shape() -> None:
     # VAD and L0 both ran on a speech window and are timed SEPARATELY
     assert "vad" in m["stage_latency"] and "l0" in m["stage_latency"]
     assert m["stage_latency"]["vad"]["calls"] == 1
+
+
+def test_metrics_splits_gated_from_discharged() -> None:
+    c = Cascade(manifest_path=NO_MANIFEST)
+    c.score(_speech(), "s", 0.0, 0)   # clean speech -> discharged at L0
+    c.score(_silence(), "s", 1.0, 1)  # silence -> VAD-gated
+    m = c.metrics()
+    assert m["vad_gated"] == 1
+    assert m["l0_discharged"] == 1
+    # discharge_rate is over NON-gated windows only: 1 discharged / 1 non-gated
+    assert m["discharge_rate"] == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -240,12 +403,12 @@ def test_hot_stickiness_survives_clean_windows() -> None:
     assert c._session("s").hot
     c.t_high = config.T_HIGH  # restore: subsequent windows score normally
     c.t_low = config.T_LOW
-    # N-1 clean (gated silence, prob 0.0) windows: must STILL be hot
+    # N-1 clean SPEECH windows (discharged, non-gated): must STILL be hot
     for i in range(config.HYSTERESIS_CLEAN_WINDOWS - 1):
-        c.score(_silence(), "s", float(i + 1), i + 1)
+        c.score(_speech(), "s", float(i + 1), i + 1)
         assert c._session("s").hot, f"cooled too early, after {i + 1} clean windows"
     # the Nth clean window finally cools it
-    c.score(_silence(), "s", 99.0, 99)
+    c.score(_speech(), "s", 99.0, 99)
     assert not c._session("s").hot
 
 
@@ -332,8 +495,16 @@ def test_bytes_adapter_roundtrip() -> None:
     scorer = CascadeScorer()
     ws = scorer.score(buf.getvalue(), "s", 0, 0.0)
     _check_shape(ws)
-    dur = scorer.enroll("s", buf.getvalue())
-    assert abs(dur - 3.0) < 0.01
+    # enroll needs a valid-length clip (>=4s); roundtrip the 8s enroll fixture
+    enroll_buf = _io.BytesIO()
+    enroll_audio = _enroll_audio()
+    with wave.open(enroll_buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SR)
+        w.writeframes((enroll_audio * 32767).astype(np.int16).tobytes())
+    dur = scorer.enroll("s", enroll_buf.getvalue())
+    assert abs(dur - len(enroll_audio) / SR) < 0.05
 
 
 def run_all() -> None:

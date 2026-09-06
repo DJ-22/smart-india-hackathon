@@ -1,11 +1,28 @@
-import os
-from dotenv import load_dotenv
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from livekit import api
 
-load_dotenv()
-KEY    = os.environ["LIVEKIT_API_KEY"]
-SECRET = os.environ["LIVEKIT_API_SECRET"]
-URL    = os.environ["LIVEKIT_URL"]
+# .env is loaded once inside common.config (against REPO_ROOT), so importing
+# these works regardless of the directory this script is run from.
+from common import config
+
+_MISSING = [
+    name for name in ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET")
+    if not getattr(config, name)
+]
+if _MISSING:
+    raise SystemExit(
+        "Missing required LiveKit credential(s): "
+        + ", ".join(_MISSING)
+        + f"\nSet them in {config.REPO_ROOT / '.env'} (see .env.example) or in the shell."
+    )
+
+URL    = config.LIVEKIT_URL
+KEY    = config.LIVEKIT_API_KEY
+SECRET = config.LIVEKIT_API_SECRET
 
 def make_token(identity: str, room: str = "demo",
                publish: bool = True, subscribe: bool = True) -> str:
@@ -23,6 +40,7 @@ def make_token(identity: str, room: str = "demo",
     )
 
 if __name__ == "__main__":
-    import sys
     who = sys.argv[1] if len(sys.argv) > 1 else "caller"
-    print(make_token(who))
+    # Print both, labelled, so they can be pasted straight into meet.livekit.io.
+    print(f"URL:   {URL}")
+    print(f"TOKEN: {make_token(who)}")

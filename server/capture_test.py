@@ -1,6 +1,6 @@
 """Standalone diagnostic: join the LiveKit room, capture 10 s of remote
-audio, write a WAV (default data/captures/test.wav), print loud stats.
-NOT part of the server.
+audio, write a WAV (default data/captures/test_<timestamp>.wav), print loud
+stats. NOT part of the server.
 
 Usage (from repo root):
   python server\\capture_test.py --room demo
@@ -18,6 +18,7 @@ import argparse
 import asyncio
 import sys
 import wave
+from datetime import datetime
 from pathlib import Path
 from typing import List
 
@@ -30,7 +31,7 @@ from server.tokens import URL, make_token
 
 TARGET_SR = 16000
 CAPTURE_S = 10.0
-DEFAULT_OUT = Path(__file__).resolve().parent.parent / "data" / "captures" / "test.wav"
+DEFAULT_OUT_DIR = Path(__file__).resolve().parent.parent / "data" / "captures"
 
 
 async def _capture_track(track: rtc.Track, buf: List[np.ndarray],
@@ -68,10 +69,16 @@ async def main() -> None:
                          "default: lock on to the first audio track seen")
     ap.add_argument("--join-as", default="capture-test",
                     help="identity this diagnostic joins the room as")
-    ap.add_argument("--out", default=str(DEFAULT_OUT),
-                    help="where to write the captured WAV")
+    ap.add_argument("--out", default=None,
+                    help="where to write the captured WAV "
+                         "(default: data/captures/test_<timestamp>.wav)")
     args = ap.parse_args()
-    out_path = Path(args.out).resolve()
+    # Timestamped default so re-running never collides with a file still open
+    # in a media player (Windows file locking would otherwise error).
+    if args.out:
+        out_path = Path(args.out).resolve()
+    else:
+        out_path = DEFAULT_OUT_DIR / f"test_{datetime.now():%Y%m%d_%H%M%S}.wav"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     token = make_token(args.join_as, room=args.room, publish=False, subscribe=True)
