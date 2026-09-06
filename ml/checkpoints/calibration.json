@@ -1,0 +1,18 @@
+{
+  "T_LOW": 0.0,
+  "T_HIGH": 0.9973878624499063,
+  "cascade": {
+    "val_opus": {
+      "l0_resolved": 0.0,
+      "gpu_touched": 0.9259834368530021,
+      "missed_fake_at_l0": 0.0,
+      "fused_eer": 0.047101449275362334
+    },
+    "xling_opus": {
+      "l0_resolved": 0.0,
+      "gpu_touched": 0.9823274424808269,
+      "missed_fake_at_l0": 0.0,
+      "fused_eer": 0.15371781187458305
+    }
+  }
+}
