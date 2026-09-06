@@ -64,11 +64,30 @@ and 20 clips from the same tool said 86% caught at 6.8% EER. Use ~20.
 That is the one number nothing here can substitute for: everything below is
 measured against IndicTTS renderings, not against the generator on stage.
 
+## Config: which file holds what
+
+Two config modules, and the split is deliberate:
+
+- **`common/config.py`** — the A+B+C contract. Only what the *running server*
+  needs: the calibrated thresholds, the band cut-offs, `WINDOW_S` / `HOP_S`,
+  the feature flags, and `REPO`. B and C import this.
+- **`ml/config.py`** — how the model was *built*: `SR`, `CROP_S`,
+  `HELDOUT_LANGS`, the dataset cache paths, `HF_DATASET`, `BASE_CKPT`,
+  `CKPT_DIR`. Nothing outside `ml/` imports it.
+
+The one pair the server also needs, `(sr, crop_s)`, reaches it through
+`ml/checkpoints/MANIFEST.json` — `ml/export.py` copies both in. So B never has
+to import a training constant, and a retrain that changes the crop length
+propagates through the manifest rather than through a shared edit.
+
+`ml/config.py` imports `REPO` from `common/config.py`, and that import is what
+loads `.env`. Don't remove it.
+
 ## Where the data lives
 
-`VG_DATA_DIR` in `.env` points the cache outside the repo (this repo sits in a
-OneDrive folder; several GB of WAVs syncing during a sprint is not a good time).
-Default is `<repo>/data` if the variable is unset.
+`VG_DATA_DIR` in `.env` points the cache outside the repo, so several GB of WAVs
+never land in a synced folder or in `git status`. Default is `<repo>/data` if the
+variable is unset.
 
 ## Things that are easy to get wrong here
 

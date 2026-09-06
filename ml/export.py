@@ -10,7 +10,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.config import CKPT_DIR, CROP_S, REPO, SR
+from common.config import REPO
+from ml.config import CKPT_DIR, CROP_S, SR
 
 
 def _rel(p):

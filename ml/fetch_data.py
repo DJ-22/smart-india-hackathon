@@ -27,7 +27,8 @@ import soundfile as sf
 from scipy.signal import resample_poly
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.config import CLIPS_DIR, DATA_DIR, HF_DATASET, INDEX_JSONL, MANIFEST, SR
+from ml.config import (CLIPS_DIR, DATA_DIR, HF_DATASET, INDEX_JSONL, MANIFEST,
+                       SR)
 
 BASE = "https://datasets-server.huggingface.co"
 PAGE = 100

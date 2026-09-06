@@ -20,8 +20,9 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.config import CKPT_DIR, SR, WINDOW_S
+from common.config import WINDOW_S
 from ml.augment import codec_only, reverb
+from ml.config import CKPT_DIR, SR
 from ml.data import load_manifest, make_splits
 from ml.infer import read_audio
 from ml.metrics import auc, eer

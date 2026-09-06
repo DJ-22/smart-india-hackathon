@@ -47,20 +47,10 @@ HOP_S = 1.0
 CASCADE_ENABLED = False
 L2_ENABLED = True          # kill switch for speaker verification
 
-# ------------------------------------------------------------------ TRAINING
-SR = 16000
-CROP_S = 4.0               # training crop length fed to the L1 transformer
-HELDOUT_LANGS = ["Tamil", "Gujarati", "Manipuri"]   # never trained on; see RESULTS.md
-# Chosen to span three language families the model never sees in training:
-# Tamil (Dravidian), Gujarati (Indo-Aryan), Manipuri (Tibeto-Burman).
-
 # ------------------------------------------------------------------- LAYOUT
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.environ.get("VG_DATA_DIR") or os.path.join(REPO, "data")
-CLIPS_DIR = os.path.join(DATA_DIR, "clips")
-MANIFEST = os.path.join(DATA_DIR, "manifest.csv")
-INDEX_JSONL = os.path.join(DATA_DIR, "index.jsonl")
-CKPT_DIR = os.path.join(REPO, "ml", "checkpoints")
 
-HF_DATASET = "SherryT997/IndicTTS-Deepfake-Challenge-Data"
-BASE_CKPT = "MelodyMachine/Deepfake-audio-detection-V2"
+# Training-side constants -- the dataset cache, the base checkpoint, the crop
+# length, the held-out languages -- live in ml/config.py. They describe how the
+# model was built, not how it is served, and nothing outside ml/ needs them.
+# `sr` and `crop_s` reach the server through ml/checkpoints/MANIFEST.json.

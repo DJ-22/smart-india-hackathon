@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.config import CROP_S, DATA_DIR, HELDOUT_LANGS, MANIFEST, SR
+from ml.config import CROP_S, DATA_DIR, HELDOUT_LANGS, MANIFEST, SR
 
 VAL_SPEAKERS = ["BEN_F", "BRX_M", "hi_m", "te_f"]
 

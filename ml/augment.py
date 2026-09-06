@@ -20,7 +20,7 @@ import soundfile as sf
 from scipy.signal import fftconvolve, lfilter, resample_poly
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.config import SR
+from ml.config import SR
 
 _OPUS_OK = None
 

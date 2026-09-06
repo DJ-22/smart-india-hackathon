@@ -11,7 +11,8 @@ import soundfile as sf
 from scipy.signal import resample_poly
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.config import CROP_S, HOP_S, SR
+from common.config import HOP_S
+from ml.config import CROP_S, SR
 
 
 def read_audio(path, sr=SR, max_s=600.0):

@@ -11,7 +11,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.config import SR
+from ml.config import SR
 
 FEATURE_NAMES = (
     ["mfcc%d_mean" % i for i in range(20)]

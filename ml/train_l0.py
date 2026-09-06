@@ -23,8 +23,8 @@ import numpy as np
 import soundfile as sf
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.config import CKPT_DIR, CROP_S, SR
 from ml.augment import codec_only
+from ml.config import CKPT_DIR, CROP_S, SR
 from ml.data import crop_or_pad, load_manifest, make_splits, split_report
 from ml.features import N_FEATURES, l0_features
 from ml.metrics import auc, eer, l0_threshold_sweep, t_high_sweep

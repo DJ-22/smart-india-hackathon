@@ -26,7 +26,8 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.config import CKPT_DIR, EMA_ALPHA, REPO
+from common.config import EMA_ALPHA, REPO
+from ml.config import CKPT_DIR
 from ml.data import load_manifest, make_splits
 from ml.evaluate import cascade_sim, load_l0, score_set
 from ml.metrics import eer, l0_threshold_sweep, t_high_sweep

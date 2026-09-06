@@ -30,9 +30,9 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.config import (CKPT_DIR, DATA_DIR, EMA_ALPHA, HOP_S, L1_AMBER,
-                           L1_RED, REPO, WINDOW_S)
+from common.config import EMA_ALPHA, HOP_S, L1_AMBER, L1_RED, REPO, WINDOW_S
 from ml.augment import codec_only
+from ml.config import CKPT_DIR, DATA_DIR
 from ml.metrics import auc, eer
 
 AUDIO = ("*.wav", "*.flac", "*.mp3", "*.ogg", "*.opus", "*.m4a", "*.aac")
