@@ -15,8 +15,8 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.config import BASE_CKPT, CKPT_DIR, CROP_S
 from ml.augment import opus_available
+from ml.config import BASE_CKPT, CKPT_DIR, CROP_S
 from ml.data import (Augmenter, ClipDataset, load_manifest, make_collator,
                      make_splits, split_report)
 from ml.metrics import auc, eer
@@ -160,8 +160,8 @@ def main():
 
     # load_best_model_at_end has already folded the best epoch into out_dir, so
     # the per-epoch checkpoints are now dead weight -- and they carry optimizer
-    # state, which makes each run ~2.5 GB instead of ~360 MB. That matters here:
-    # the repo lives in a synced OneDrive folder.
+    # state, which makes each run ~2.5 GB instead of ~360 MB. Four runs of that
+    # fills a laptop disk, and the weights get copied to B by hand.
     import shutil
     for name in os.listdir(out_dir):
         if name.startswith("checkpoint-"):
