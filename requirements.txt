@@ -1,0 +1,53 @@
+# VoiceGuard — Python dependencies (Python 3.12)
+#
+# Pinned to the versions verified in the project's .venv. Install into a fresh
+# virtual environment from the repo root:
+#
+#     python -m venv .venv
+#     .venv\Scripts\activate            # PowerShell:  .\.venv\Scripts\Activate.ps1
+#     pip install -r requirements.txt
+#
+# The stack splits into four roles (server / audio-bridge / ml / ui). Everything
+# is listed here so one install covers the whole repo; the section comments say
+# what each group is for if you only need a subset.
+
+# --- Shared / core -------------------------------------------------------------
+numpy==2.2.6
+python-dotenv==1.2.3          # common/config.py loads .env once, repo-root explicit
+
+# --- Scoring server: FastAPI app (server/app.py) -------------------------------
+fastapi==0.141.1
+uvicorn==0.52.4
+
+# --- Real detection cascade (server/detector.py, server/vad.py) ----------------
+# Heavy; only needed for STUB_MODE=0. The server degrades to the stub scorer if
+# these or the model weights are missing, so the UI can run without them.
+torch==2.11.0                 # see CUDA note at the bottom of this file
+transformers==5.16.1          # wav2vec2 L1 classifier
+speechbrain==1.1.1            # ECAPA speaker model (L2, optional)
+lightgbm==4.7.0               # L0 gate (LightGBM text model)
+librosa==1.0.0                # L0 acoustic features
+soundfile==0.14.0             # WAV/Opus decode (libsndfile)
+scipy==1.18.1
+
+# --- LiveKit audio bridge (server/livekit_agent.py, tokens.py, capture_test.py)
+livekit==1.1.17               # real-time SDK (livekit.rtc)
+livekit-api==1.2.1            # access-token minting (livekit.api)
+aiohttp==3.14.3               # non-blocking POST /score from the agent
+
+# --- Streamlit dashboard (ui/) -------------------------------------------------
+streamlit==1.63.0
+plotly==7.0.0
+requests==2.34.2
+
+# --- ML training & evaluation only (ml/*) --------------------------------------
+# Not needed to run the demo; required to retrain/evaluate models.
+pandas==3.0.5
+scikit-learn==1.9.0
+
+# ------------------------------------------------------------------------------
+# CUDA note: `pip install torch==2.11.0` from PyPI installs a CPU-only build.
+# For GPU inference install the CUDA build from the PyTorch index instead, e.g.
+#     pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+# (the verified .venv uses the cu128 build). After any torch reinstall, confirm
+# `python -c "import torch; print(torch.cuda.is_available())"` prints True.

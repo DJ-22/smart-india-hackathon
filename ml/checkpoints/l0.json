@@ -1,0 +1,7 @@
+{
+  "format": "lightgbm-text",
+  "crop_s": 4.0,
+  "sr": 16000,
+  "n_features": 76,
+  "num_threads": 1
+}

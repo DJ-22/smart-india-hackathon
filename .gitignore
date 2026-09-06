@@ -216,3 +216,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# VoiceGuard
+data/
+data_local/
+*.wav
+!fixtures/*.wav
+!ui/assets/*.wav
+# checkpoints: keep the small artifacts B's detector.py reads, drop the weights
+# and caches (share l1_run*/ out of band -- 361 MB each)
+ml/checkpoints/*
+!ml/checkpoints/MANIFEST.json
+!ml/checkpoints/calibration.json
+!ml/checkpoints/l0.txt
+!ml/checkpoints/l0.json
+!ml/checkpoints/l0_metrics.json
+
