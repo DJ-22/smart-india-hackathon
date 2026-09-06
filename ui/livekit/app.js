@@ -19,8 +19,10 @@
 /* ============================================================
    URL PARAMETERS
    ============================================================ */
-
-const params = new URLSearchParams(window.location.search);
+const params =
+    new URLSearchParams(
+        window.location.search
+    );
 
 const LIVEKIT_URL =
     params.get("url") ||
@@ -29,6 +31,8 @@ const LIVEKIT_URL =
 const TOKEN =
     params.get("token") ||
     window.VOICEGUARD_LIVEKIT_TOKEN;
+
+
 
 /* ============================================================
    DOM ELEMENTS
@@ -340,15 +344,20 @@ function setupExistingParticipant(
     participant
 ) {
 
+    /*
+     * Never display the dashboard itself.
+     */
+
+    if (
+        participant === room.localParticipant ||
+        participant.identity === room.localParticipant.identity
+    ) {
+        return;
+    }
+
     createParticipantCard(
         participant
     );
-
-
-    /*
-     * Publications already
-     * subscribed to.
-     */
 
     participant.trackPublications
         .forEach(
@@ -366,7 +375,6 @@ function setupExistingParticipant(
             }
         );
 }
-
 
 /* ============================================================
    SPEAKING INDICATOR

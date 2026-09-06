@@ -13,7 +13,15 @@ from risk import (
     L1_RED,
 )
 
+import sys
+from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from tokens import make_token
 # =========================================================
 # CONFIG
 # =========================================================
@@ -126,6 +134,25 @@ def get_livekit_credentials():
         )
 
     token = make_token(
+    identity=f"voiceguard-monitor-{SESSION_ID}",
+    room="demo",
+    publish=False,
+    subscribe=True,
+)
+
+    return {
+        "url": LIVEKIT_URL,
+        "token": token,
+    }
+
+def get_livekit_credentials():
+
+    if not LIVEKIT_URL:
+        raise RuntimeError(
+            "LIVEKIT_URL is not set."
+        )
+
+    token = make_token(
         identity=f"voiceguard-{SESSION_ID}",
         room="demo",
         publish=True,
@@ -136,23 +163,25 @@ def get_livekit_credentials():
         "url": LIVEKIT_URL,
         "token": token,
     }
-
-
 def render_livekit():
+    """
+    Render the existing LiveKit room inside Streamlit.
+
+    The token is generated server-side using tokens.py.
+    Only the temporary JWT and LiveKit URL are exposed
+    to the embedded browser component.
+    """
 
     try:
+        livekit_data = get_livekit_credentials()
 
-        credentials = get_livekit_credentials()
-
-        livekit_url = credentials["url"]
-        token = credentials["token"]
+        livekit_url = livekit_data["url"]
+        token = livekit_data["token"]
 
     except Exception as exc:
-
         st.error(
             f"LiveKit connection setup failed: {exc}"
         )
-
         return
 
     html_path = os.path.join(
@@ -161,36 +190,67 @@ def render_livekit():
         "index.html",
     )
 
-    if not os.path.exists(html_path):
+    app_js_path = os.path.join(
+        os.path.dirname(__file__),
+        "livekit",
+        "app.js",
+    )
 
+    if not os.path.exists(html_path):
         st.error(
             f"LiveKit UI not found: {html_path}"
         )
-
         return
 
+    if not os.path.exists(app_js_path):
+        st.error(
+            f"LiveKit JavaScript not found: {app_js_path}"
+        )
+        return
+
+    # Read HTML
     with open(
         html_path,
         "r",
         encoding="utf-8",
     ) as file:
-
         html = file.read()
 
-    # Pass temporary credentials to the
-    # embedded LiveKit page.
+    # Read JavaScript
+    with open(
+        app_js_path,
+        "r",
+        encoding="utf-8",
+    ) as file:
+        app_js = file.read()
+
+    # ---------------------------------------------------------
+    # IMPORTANT:
+    #
+    # Put credentials BEFORE app.js executes.
+    # ---------------------------------------------------------
+
+    credentials_script = f"""
+    <script>
+        window.VOICEGUARD_LIVEKIT_URL = {livekit_url!r};
+        window.VOICEGUARD_LIVEKIT_TOKEN = {token!r};
+    </script>
+    """
+
+    # Remove the external app.js reference from index.html.
+    html = html.replace(
+        '<script src="./app.js"></script>',
+        ""
+    )
+
+    # Inject credentials + app.js immediately before </body>.
     html = html.replace(
         "</body>",
-        f"""
-        <script>
-            window.VOICEGUARD_LIVEKIT_URL =
-                {livekit_url!r};
-
-            window.VOICEGUARD_LIVEKIT_TOKEN =
-                {token!r};
-        </script>
-        </body>
-        """,
+        credentials_script
+        + "<script>"
+        + app_js
+        + "</script>"
+        + "</body>"
     )
 
     components.html(
@@ -198,7 +258,6 @@ def render_livekit():
         height=500,
         scrolling=False,
     )
-
 # =========================================================
 # PROCESS WINDOWS
 # =========================================================
@@ -329,11 +388,7 @@ call_col, monitor_col = st.columns(
 
 with call_col:
 
-    st.subheader("📞 Live Call")
-
     render_livekit()
-
-
 # =========================================================
 # SECURITY MONITOR
 # =========================================================
@@ -868,11 +923,3 @@ else:
             f"• {event}"
         )
 
-
-# =========================================================
-# AUTO REFRESH
-# =========================================================
-
-time.sleep(0.5)
-
-st.rerun()
